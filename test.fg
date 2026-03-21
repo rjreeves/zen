@@ -1,0 +1,9 @@
+requires {
+  proc.read
+}
+
+process.list
+  | where cpu * 2 > 20
+  | sort cpu desc
+  | limit 3
+  | select name, cpu

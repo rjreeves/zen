@@ -1,0 +1,7 @@
+requires {
+  fs.read
+}
+
+files = fs.list "C:\logs"
+
+files | where size > 1mb | select name, size
