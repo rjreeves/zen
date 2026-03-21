@@ -7,3 +7,4 @@ process.list
   | sort cpu desc
   | limit 3
   | select name, cpu
+  
