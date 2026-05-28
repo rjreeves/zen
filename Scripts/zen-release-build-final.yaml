@@ -6,6 +6,10 @@ requires:
   - fs.write
 
 steps:
+  - name: announce-workflow
+    run: echo Starting workflow zen-release-build-final
+    save_as: workflow_announcement
+
   - name: bump-patch-version
     run: powershell -ExecutionPolicy Bypass -File Scripts\bump-version.ps1 patch -NoCargoCheck
     save_as: version_bump
@@ -57,4 +61,3 @@ steps:
     zen: archive.list "dist/zen-win64.zip"
     save_as: zip_entries
     checkpoint: zip-verified
-

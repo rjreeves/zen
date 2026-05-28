@@ -6,8 +6,12 @@ requires:
   - fs.write
 
 steps:
+  - name: announce-workflow
+    run: echo Starting workflow zen-release-build
+    save_as: workflow_announcement
+
   - name: bump-patch-version
-    run: powershell -ExecutionPolicy Bypass -File Scripts\bump-version.ps1 patch -NoCargoCheck
+    run: powershell -ExecutionPolicy Bypass -File Scripts/bump-version.ps1 patch -NoCargoCheck
     save_as: version_bump
 
   - name: build-release

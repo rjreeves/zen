@@ -1,6 +1,6 @@
 [package]
 name = "zen"
-version = "0.9.10"
+version = "1.0.2"
 edition = "2021"
 description = "Zen - Windows-first scripting CLI with typed pipelines and permissions"
 license = "MIT"
