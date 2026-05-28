@@ -1,0 +1,45 @@
+name: book-postgres-backup
+
+requires:
+  - postgres.read
+  - proc.exec
+
+steps:
+  - name: check-passwordless-auth
+    zen: pg.auth.passwordless postgres
+    save_as: pg_auth
+    timeout: 10s
+    checkpoint: auth-checked
+
+  - name: explain-auth-required
+    if: outputs.pg_auth.passwordless == false
+    run: echo Postgres needs passwordless auth before backup can run.
+
+  - name: dump-db
+    if: outputs.pg_auth.passwordless == true
+    run: pg_dump postgres --file backup.sql
+    save_as: dump
+    artifacts:
+      - name: backup_sql
+        path: backup.sql
+    timeout: 5m
+    checkpoint: dumped
+    retry:
+      attempts: 3
+      delay: 10s
+    on_failure:
+      - emit: backup.dump.failed
+    rollback:
+      - run: powershell -NoProfile -Command "Remove-Item -LiteralPath backup.sql -ErrorAction SilentlyContinue"
+      - emit: backup.dump.rolled_back
+    finally:
+      - emit: backup.dump.finished
+
+  - name: verify-backup
+    if: outputs.dump.success == true
+    run: powershell -NoProfile -Command "if ((Test-Path -LiteralPath backup.sql) -and ((Get-Item -LiteralPath backup.sql).Length -gt 0)) { exit 0 } else { exit 1 }"
+    checkpoint: verified
+    rollback:
+      - run: powershell -NoProfile -Command "Remove-Item -LiteralPath backup.sql -ErrorAction SilentlyContinue"
+      - emit: backup.verify.rolled_back
+

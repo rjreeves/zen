@@ -1,0 +1,38 @@
+name: book-postgres-backup-to-dropbox
+
+requires:
+  - postgres.read
+  - proc.exec
+  - dropbox.write
+
+steps:
+  - name: check-passwordless-auth
+    zen: pg.auth.passwordless postgres
+    save_as: pg_auth
+    timeout: 10s
+    checkpoint: auth-checked
+
+  - name: dump-db
+    if: outputs.pg_auth.passwordless == true
+    run: pg_dump postgres --file backup.sql
+    save_as: dump
+    artifacts:
+      - name: backup_sql
+        path: backup.sql
+    timeout: 5m
+    checkpoint: dumped
+    retry:
+      attempts: 3
+      delay: 10s
+    rollback:
+      - run: powershell -NoProfile -Command "Remove-Item -LiteralPath backup.sql -ErrorAction SilentlyContinue"
+      - emit: backup.dump.rolled_back
+
+  - name: upload-dropbox
+    if: outputs.dump.success == true
+    zen: dropbox.upload.verify "backup.sql" "/backups/backup.sql" overwrite
+    save_as: upload
+    checkpoint: uploaded
+    finally:
+      - emit: backup.upload.finished
+

@@ -1,1 +1,9 @@
 /target
+/target_smoke
+/dist
+bin/
+obj/
+.zen/runtime.db
+.zen/state.json
+.zen/schedules.json
+.zen/events.log

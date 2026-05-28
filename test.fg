@@ -1,10 +1,75 @@
 requires {
   proc.read
+  proc.exec
+  fs.read
 }
 
-process.list
-  | where cpu * 2 > 20
-  | sort cpu desc
-  | limit 3
-  | select name, cpu
-  
+//process.list 
+// | where cpu  > 1
+//  | sort cpu desc
+//  | limit 3
+//  | select name, cpu
+
+//exec "echo zen-exec-ok-A"  
+echo -n "zen-exec-ok-D"
+
+//users = fs.list "."
+//echo table users
+//process.list
+//  | limit 2
+//  | echo table users
+
+//echo -n "line one"  "line two"
+//#exec pg_dump retry 3 timeout 30s
+
+//pass = "zen-secret"
+//let result = exec set PGPASSWORD {
+//    env: {
+//        PGPASSWORD: $pass
+//    }
+//}
+//echo json result.stdout
+
+let now = time now
+echo now
+time unix | time format "%Y"
+payload = "[{\"name\":\"ada\"}]"
+payload
+  | parse json
+  | time stamp seen_at
+  | echo table
+
+echo now info "backup started"
+
+
+//time.freeze "2026-05-14T12:34:56Z"
+//let result  = measure time.now
+//echo table result
+//echo 
+measure time.now | select duration_ms | echo
+
+
+time.freeze "2026-05-14T00:00:00Z"
+time.since "2026-05-01" | select days, human |echo table
+
+measure sleep 20ms | select duration_ms, result
+
+echo sleep deltas
+measure sleep jitter 5ms | select duration_ms, result
+measure sleep 5ms jitter 5ms | select duration_ms, result
+measure sleep until "1970-01-01T00:00:00Z" | select duration_ms, result
+
+time.parse "tomorrow"
+time.parse "in 3 days"
+time.since "yesterday" | select hours, human
+measure sleep until "yesterday" | select duration_ms, result
+
+
+#sleep until "tomorrow"
+
+
+exec cd workdir "../../src" | select stdout, success
+
+echo Benchmark
+
+benchmark 10 sleep 20ms | select runs, min_ms, avg_ms, max_ms

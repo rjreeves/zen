@@ -1,0 +1,31 @@
+requires {
+  secrets.write
+  dropbox.read
+  secrets.write
+}
+
+let DROPBOX_APP_SECRET="3cmwytm6akhs9ic"
+let DROPBOX_REFRESH_TOKEN="67H2GzsHSFsAAAAAAAAAASQEUZOQHrEbHdjGnJB1Zc3dj37i3NgbeZAnbDJB8Kab"
+let DROPBOX_APP_KEY="s4ccdl1f3qscogb"
+
+
+
+dropbox.status {
+  env: {
+    DROPBOX_REFRESH_TOKEN: DROPBOX_REFRESH_TOKEN,
+    DROPBOX_APP_KEY: DROPBOX_APP_KEY,
+    DROPBOX_APP_SECRET: DROPBOX_APP_SECRET
+  }
+}
+
+
+dropbox.secrets.save {
+  env: {
+    DROPBOX_REFRESH_TOKEN: DROPBOX_REFRESH_TOKEN,
+    DROPBOX_APP_KEY: DROPBOX_APP_KEY,
+    DROPBOX_APP_SECRET: DROPBOX_APP_SECRET
+  }
+}
+
+
+dropbox.status

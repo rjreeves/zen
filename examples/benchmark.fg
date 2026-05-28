@@ -1,0 +1,2 @@
+benchmark 10 sleep 20ms | select runs, min_ms, avg_ms, median_ms, max_ms
+benchmark 5 time.now | select runs, avg_ms, failures

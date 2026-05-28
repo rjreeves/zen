@@ -1,0 +1,11 @@
+# Zen REPL startup file.
+# Put session setup here, such as:
+
+requires {
+    workspace.read
+    fs.read
+    fs.write
+}
+let project="Zen"
+echo "Hi. What today ?"
+

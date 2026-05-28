@@ -1,0 +1,6 @@
+requires {
+  dropbox.read
+}
+
+dropbox.status
+

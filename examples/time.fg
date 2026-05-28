@@ -1,0 +1,12 @@
+time.timestamp
+time.local
+time.local.format "%Y-%m-%d %H:%M"
+
+time.freeze "2026-05-14T12:34:56Z"
+time.now
+time.local
+time.parse "tomorrow"
+time.parse "in 3 days"
+time.since "2026-05-01" | select days, human
+time.since "yesterday" | select hours, human
+time.freeze clear

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::runtime::values::Value;
 use std::collections::HashMap;
 
@@ -10,6 +12,8 @@ pub fn render(value: &Value) {
         Value::Number(n) => println!("{}", n),
 
         Value::String(s) => println!("{}", s),
+
+        Value::Secret(_) => println!("{}", value.redacted()),
 
         Value::List(items) => {
             if items.is_empty() {
@@ -90,6 +94,7 @@ fn render_table(items: &Vec<Value>) {
 fn format_value(val: &Value) -> String {
     match val {
         Value::String(s) => s.clone(),
+        Value::Secret(_) => val.redacted().into(),
         Value::Number(n) => format!("{}", n),
         Value::Bool(b) => format!("{}", b),
         _ => format!("{:?}", val),

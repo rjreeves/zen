@@ -1,0 +1,7 @@
+measure time.now | select duration_ms, result
+measure time.local.format "%Y" | select duration_ms, result
+
+measure sleep 20ms | select duration_ms, result
+measure sleep jitter 5ms | select duration_ms, result
+measure sleep 5ms jitter 5ms | select duration_ms, result
+measure sleep until "1970-01-01T00:00:00Z" | select duration_ms, result

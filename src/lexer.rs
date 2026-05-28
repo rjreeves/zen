@@ -1,6 +1,4 @@
-use std::iter::Peekable;
-use std::str::Chars;
-use std::fmt;
+#![allow(dead_code)]
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -8,16 +6,26 @@ pub enum Token {
     Requires,
     Where,
     Select,
+    If,
+    Else,
+    Try,
+    Catch,
+    Finally,
     True,
     False,
+    Null,
 
     // Symbols
     LBrace,   // {
     RBrace,   // }
+    LBracket, // [
+    RBracket, // ]
     Pipe,     // |
     Equals,   // =
     Dot,      // .
     Comma,    // ,
+    Colon,    // :
+    Dollar,   // $
 
     // Operators
     Greater,
@@ -27,32 +35,28 @@ pub enum Token {
     EqEq,
     NotEq,
 
-    Plus,       // +
-    Minus,      // -
-    Star,       // *
-    Slash,      // /
+    Plus,  // +
+    Minus, // -
+    Star,  // *
+    Slash, // /
 
-   // Gt,         // >
-   // Lt,         // <
-   // Gte,        // >=
-   // Lte,        // <=
-   // Neq,        // !=
+    // Gt,         // >
+    // Lt,         // <
+    // Gte,        // >=
+    // Lte,        // <=
+    // Neq,        // !=
+    AndAnd, // &&
+    OrOr,   // ||
 
-    AndAnd,     // &&
-    OrOr,       // ||
-
-
-
+    Bang, // !
 
     // Literals
     Ident(String),
     String(String),
     Number(f64),
     Newline,
-    EOF,
+    Eof,
 }
-
-
 
 #[derive(Debug, Clone)]
 pub struct SpannedToken {
@@ -75,17 +79,16 @@ impl Lexer {
             pos: 0,
             line: 1,
             col: 1,
-
         }
     }
 
     fn make_token(&self, token: Token) -> SpannedToken {
-    SpannedToken {
-        token,
-        line: self.line,
-        col: self.col,
+        SpannedToken {
+            token,
+            line: self.line,
+            col: self.col,
+        }
     }
-}
 
     pub fn tokenize(mut self) -> Result<Vec<SpannedToken>, String> {
         let mut tokens = Vec::new();
@@ -96,10 +99,14 @@ impl Lexer {
                     self.advance();
                 }
 
+                '#' => {
+                    self.skip_comment();
+                }
+
                 '\n' => {
                     self.advance();
                     tokens.push(self.token(Token::Newline));
-            //        self.line += 1;
+                    //        self.line += 1;
                     self.col = 0;
                 }
 
@@ -113,9 +120,34 @@ impl Lexer {
                     tokens.push(self.token(Token::RBrace));
                 }
 
+                '[' => {
+                    self.advance();
+                    tokens.push(self.token(Token::LBracket));
+                }
+
+                ']' => {
+                    self.advance();
+                    tokens.push(self.token(Token::RBracket));
+                }
+
                 '|' => {
                     self.advance();
-                    tokens.push(self.token(Token::Pipe));
+                    if self.peek() == Some('|') {
+                        self.advance();
+                        tokens.push(self.token(Token::OrOr));
+                    } else {
+                        tokens.push(self.token(Token::Pipe));
+                    }
+                }
+
+                '&' => {
+                    self.advance();
+                    if self.peek() == Some('&') {
+                        self.advance();
+                        tokens.push(self.token(Token::AndAnd));
+                    } else {
+                        return Err(self.error("Unexpected '&'; use '&&' for logical and"));
+                    }
                 }
 
                 '=' => {
@@ -134,7 +166,7 @@ impl Lexer {
                         self.advance();
                         tokens.push(self.token(Token::NotEq));
                     } else {
-                        return Err(self.error("Unexpected '!'"));
+                        tokens.push(self.token(Token::Bang));
                     }
                 }
 
@@ -168,6 +200,16 @@ impl Lexer {
                     tokens.push(self.token(Token::Comma));
                 }
 
+                ':' => {
+                    self.advance();
+                    tokens.push(self.token(Token::Colon));
+                }
+
+                '$' => {
+                    self.advance();
+                    tokens.push(self.token(Token::Dollar));
+                }
+
                 '"' => {
                     tokens.push(self.read_string()?);
                 }
@@ -197,8 +239,12 @@ impl Lexer {
                 }
 
                 '/' => {
-                    self.advance();
-                    tokens.push(self.make_token(Token::Slash));
+                    if self.peek_next() == Some('/') {
+                        self.skip_comment();
+                    } else {
+                        self.advance();
+                        tokens.push(self.make_token(Token::Slash));
+                    }
                 }
 
                 _ => {
@@ -207,8 +253,17 @@ impl Lexer {
             }
         }
 
-        tokens.push(self.token(Token::EOF));
+        tokens.push(self.token(Token::Eof));
         Ok(tokens)
+    }
+
+    fn skip_comment(&mut self) {
+        while let Some(ch) = self.peek() {
+            if ch == '\n' {
+                break;
+            }
+            self.advance();
+        }
     }
 
     fn read_string(&mut self) -> Result<SpannedToken, String> {
@@ -259,28 +314,17 @@ impl Lexer {
 
         let mut multiplier = 1.0;
 
-        if let Some(suffix) = self.peek() {
-            match suffix {
-                'k' | 'K' => {
-                    self.advance();
-                    multiplier = 1024.0;
-                }
-                'm' | 'M' => {
-                    self.advance();
-                    multiplier = 1024.0 * 1024.0;
-                }
-                'g' | 'G' => {
-                    self.advance();
-                    multiplier = 1024.0 * 1024.0 * 1024.0;
-                }
-                _ => {}
-            }
-            if matches!(suffix, 'k' | 'K' | 'm' | 'M' | 'g' | 'G') {
-                // Optional trailing 'b'
-                if self.peek() == Some('b') || self.peek() == Some('B') {
-                    self.advance();
-                }
-            }
+        if matches!(self.peek(), Some('k' | 'K' | 'm' | 'M' | 'g' | 'G'))
+            && matches!(self.peek_next(), Some('b' | 'B'))
+        {
+            let suffix = self.advance().unwrap();
+            multiplier = match suffix {
+                'k' | 'K' => 1024.0,
+                'm' | 'M' => 1024.0 * 1024.0,
+                'g' | 'G' => 1024.0 * 1024.0 * 1024.0,
+                _ => 1.0,
+            };
+            self.advance();
         }
 
         let num: f64 = raw.parse().map_err(|_| self.error("Invalid number"))?;
@@ -303,40 +347,44 @@ impl Lexer {
             "requires" => Token::Requires,
             "where" => Token::Where,
             "select" => Token::Select,
+            "if" => Token::If,
+            "else" => Token::Else,
+            "try" => Token::Try,
+            "catch" => Token::Catch,
+            "finally" => Token::Finally,
             "true" => Token::True,
             "false" => Token::False,
+            "null" => Token::Null,
             _ => Token::Ident(value),
         };
 
         self.token(token)
     }
 
-    fn peek(&mut self) -> Option<char> {        
+    fn peek(&mut self) -> Option<char> {
         self.input.get(self.pos).copied()
     }
-
 
     fn peek_next(&self) -> Option<char> {
         self.input.get(self.pos + 1).copied()
     }
 
+    fn advance(&mut self) -> Option<char> {
+        let ch = self.input.get(self.pos).cloned();
 
-fn advance(&mut self) -> Option<char> {
-    let ch = self.input.get(self.pos).cloned();
+        if let Some(c) = ch {
+            self.pos += 1;
 
-    if let Some(c) = ch {
-        self.pos += 1;
-
-        if c == '\n' {
-            self.line += 1;
-            self.col = 1;
-        } else {
-            self.col += 1;
+            if c == '\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
         }
-    }
 
-    ch
-}
+        ch
+    }
     fn token(&self, token: Token) -> SpannedToken {
         SpannedToken {
             token,
@@ -380,5 +428,104 @@ files | where size > 1mb | select name, size
 
         let tokens = Lexer::new(src).tokenize().unwrap();
         assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    fn lexes_duration_suffixes_as_number_and_unit() {
+        let tokens = Lexer::new("20ms 1m 2s").tokenize().unwrap();
+        let kinds: Vec<Token> = tokens.into_iter().map(|token| token.token).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                Token::Number(20.0),
+                Token::Ident("ms".into()),
+                Token::Number(1.0),
+                Token::Ident("m".into()),
+                Token::Number(2.0),
+                Token::Ident("s".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_size_suffixes_when_b_is_present() {
+        let tokens = Lexer::new("1kb 1mb 1gb").tokenize().unwrap();
+        let kinds: Vec<Token> = tokens.into_iter().map(|token| token.token).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                Token::Number(1024.0),
+                Token::Number(1024.0 * 1024.0),
+                Token::Number(1024.0 * 1024.0 * 1024.0),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_square_brackets_for_list_literals() {
+        let tokens = Lexer::new("[\"a\", \"b\"]").tokenize().unwrap();
+        let kinds: Vec<Token> = tokens.into_iter().map(|token| token.token).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                Token::LBracket,
+                Token::String("a".into()),
+                Token::Comma,
+                Token::String("b".into()),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_if_else_keywords() {
+        let tokens = Lexer::new("if true { } else { }").tokenize().unwrap();
+        let kinds: Vec<Token> = tokens.into_iter().map(|token| token.token).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                Token::If,
+                Token::True,
+                Token::LBrace,
+                Token::RBrace,
+                Token::Else,
+                Token::LBrace,
+                Token::RBrace,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_logical_operators() {
+        let tokens = Lexer::new("true && false || !false").tokenize().unwrap();
+        let kinds: Vec<Token> = tokens.into_iter().map(|token| token.token).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                Token::True,
+                Token::AndAnd,
+                Token::False,
+                Token::OrOr,
+                Token::Bang,
+                Token::False,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_single_ampersand() {
+        let err = Lexer::new("true & false").tokenize().unwrap_err();
+
+        assert!(err.contains("use '&&'"));
     }
 }
