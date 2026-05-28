@@ -1,0 +1,67 @@
+name = "sqlite"
+description = "Native Rust SQLite external plugin for Zen."
+version = "0.1.0"
+author = "Zen workspace"
+
+[[commands]]
+name = "sqlite.info"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe info"
+summary = "Shows SQLite database information."
+usage = "sqlite.info <db>"
+examples = ["sqlite.info demo.db", "sqlite.info demo.db | get stdout | from-json | table"]
+
+[[commands]]
+name = "sqlite.tables"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe tables"
+summary = "Lists user tables and views."
+usage = "sqlite.tables <db> [--json-schema]"
+examples = ["sqlite.tables demo.db", "sqlite.tables demo.db --json-schema", "sqlite.tables demo.db | get stdout | from-json | table"]
+
+[[commands]]
+name = "sqlite.columns"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe columns"
+summary = "Lists column metadata for a table or view."
+usage = "sqlite.columns <db> <table>"
+examples = ["sqlite.columns demo.db notes", "sqlite.columns demo.db notes | get stdout | from-json | table"]
+
+[[commands]]
+name = "sqlite.schema"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe schema"
+summary = "Shows full schema, or schema for one table/view."
+usage = "sqlite.schema <db> [table]"
+examples = ["sqlite.schema demo.db", "sqlite.schema demo.db notes"]
+
+[[commands]]
+name = "sqlite.query"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe query"
+summary = "Runs a read-only SELECT, WITH, or PRAGMA query."
+usage = "sqlite.query <db> <sql> [--params JSON | --params-file PATH] [--limit N] [--json] [--timeout-ms N]"
+examples = ["sqlite.query demo.db select * from notes --limit 10", "sqlite.query demo.db select * from notes where id = :id --params-file params.json", "sqlite.query demo.db select * from notes --json"]
+
+[[commands]]
+name = "sqlite.exec"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe exec"
+summary = "Executes a write, DDL statement, or batch."
+usage = "sqlite.exec <db> <sql> [--params JSON | --params-file PATH] [--timeout-ms N]"
+examples = ["sqlite.exec demo.db create table if not exists notes", "sqlite.exec demo.db insert into notes(body) values (:body) --params-file params.json"]
+
+[[commands]]
+name = "sqlite.backup"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe backup"
+summary = "Creates a consistent SQLite backup."
+usage = "sqlite.backup <db> <destination-db> [--replace]"
+examples = ["sqlite.backup demo.db backups/demo-backup.db", "sqlite.backup demo.db backups/demo-backup.db --replace"]
+
+[[commands]]
+name = "sqlite.import-csv"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe import-csv"
+summary = "Imports CSV rows into a table, creating TEXT columns if needed."
+usage = "sqlite.import-csv <db> <csv> <table> [--replace]"
+examples = ["sqlite.import-csv demo.db notes.csv notes", "sqlite.import-csv demo.db notes.csv notes --replace"]
+
+[[commands]]
+name = "sqlite.export-csv"
+run = ".zen\\plugins\\sqlite\\sqlite-plugin.exe export-csv"
+summary = "Exports a table or SELECT query to CSV."
+usage = "sqlite.export-csv <db> <csv> [table] [--sql SELECT]"
+examples = ["sqlite.export-csv demo.db notes.csv notes", "sqlite.export-csv demo.db notes.csv --sql select * from notes"]

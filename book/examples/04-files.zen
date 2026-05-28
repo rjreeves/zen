@@ -1,0 +1,9 @@
+requires {
+  fs.read
+  fs.write
+}
+
+fs.copy "README.md" "dist/book-example-README.md"
+archive.zip "dist/book-example.zip" "dist/book-example-README.md"
+archive.list "dist/book-example.zip" | echo table
+

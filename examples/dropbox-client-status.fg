@@ -1,0 +1,15 @@
+// Checks whether the local Dropbox desktop client is installed and running.
+
+requires {
+  proc.exec
+}
+
+let result = exec "powershell.exe" "-NoProfile" "-ExecutionPolicy" "Bypass" "-File" "examples/dropbox-client-status.ps1" timeout 30s wait children
+
+echo result.stdout
+
+if result.success == false {
+  echo result.stderr
+}
+
+result | select success, exitcode, timed_out, cancelled

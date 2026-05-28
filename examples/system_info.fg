@@ -1,0 +1,27 @@
+# system_info.fg
+# Zen / Forge wrapper to examine local Windows system info, memory, and disk space.
+#
+# Put both files in your Zen project:
+#   examples/system_info.fg
+#   examples/system_info.ps1
+#
+# Run from the Zen project root:
+#   cargo run -- run examples/system_info.fg --yes
+#
+# Or from the REPL:
+#   :load examples/system_info.fg
+
+requires {
+  proc.exec
+}
+
+let ps_file = "system_info.ps1"
+
+echo "Collecting system information..."
+echo "Script:" ps_file
+
+let result = exec "powershell.exe" "-NoProfile" "-ExecutionPolicy" "BYPASS" "-File" ps_file timeout 60s wait children
+
+echo result.stdout
+echo error result.stderr
+result | select success, exitcode, timed_out, cancelled

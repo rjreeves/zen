@@ -19,10 +19,17 @@ impl PermissionSet {
             Ok(())
         } else {
             Err(format!(
-                "Permission '{}' was used but not declared in requires {{}} block.\nAdd it like:\n\nrequires {{\n  {}\n}}",
+                "Permission '{}' was used but not declared in requires {{}} block.\nTry: requires {{ {} }}\n\nAdd it like:\n\nrequires {{\n  {}\n}}",
+                permission,
                 permission,
                 permission
             ))
+        }
+    }
+
+    pub fn extend(&mut self, required: &[(String, String)]) {
+        for (left, right) in required {
+            self.allowed.insert(format!("{}.{}", left, right));
         }
     }
 

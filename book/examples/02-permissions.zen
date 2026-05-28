@@ -1,0 +1,6 @@
+requires {
+  workspace.read
+}
+
+workspace.files "src" | fields name, path, size | echo table
+

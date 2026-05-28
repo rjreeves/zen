@@ -1,0 +1,8 @@
+requires {
+  workspace.read
+  fs.write
+}
+
+workspace.files "src" | fields path, size | to-json | save "dist/source-manifest.json"
+workspace.read "dist/source-manifest.json" | from-json | echo table
+

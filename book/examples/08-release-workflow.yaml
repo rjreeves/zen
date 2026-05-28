@@ -1,0 +1,45 @@
+name: book-release-example
+
+requires:
+  - proc.exec
+  - fs.read
+  - fs.write
+
+steps:
+  - name: build-release
+    run: cargo build --release
+    checkpoint: release-built
+
+  - name: copy-release-to-dist
+    if: outputs.build-release.success == true
+    zen: fs.copy "target/release/zen.exe" "dist/zen.exe"
+    save_as: copy
+    artifacts:
+      - name: zen_exe
+        path: dist/zen.exe
+    checkpoint: release-copied
+
+  - name: copy-readme-to-dist
+    if: outputs.copy.success == true
+    zen: fs.copy "README.md" "dist/README.md"
+    save_as: readme
+    artifacts:
+      - name: readme
+        path: dist/README.md
+    checkpoint: readme-copied
+
+  - name: zip-release
+    if: outputs.readme.success == true
+    zen: archive.zip "dist/zen-win64.zip" "dist/zen.exe" "dist/README.md" ".zen" exclude ".zen/runtime.db" ".zen/state.json" ".zen/schedules.json"
+    save_as: zip
+    artifacts:
+      - name: release_zip
+        path: dist/zen-win64.zip
+    checkpoint: release-zipped
+
+  - name: verify-release-zip
+    if: outputs.zip.success == true
+    zen: archive.list "dist/zen-win64.zip"
+    save_as: zip_entries
+    checkpoint: zip-verified
+

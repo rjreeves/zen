@@ -1,0 +1,7 @@
+requires {
+  proc.exec
+}
+
+exec cd workdir src | select stdout, success
+measure exec cd workdir src | select duration_ms, result
+exec cargo --version timeout 10s | select stdout, success

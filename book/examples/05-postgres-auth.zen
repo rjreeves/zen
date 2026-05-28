@@ -1,0 +1,15 @@
+requires {
+  postgres.read
+}
+
+let database = "postgres"
+let result = pg.auth.passwordless database
+
+if result.passwordless {
+  echo "psql can connect without a password"
+  result | select database, reason, stdout, exitcode
+} else {
+  echo "psql cannot connect without a password"
+  result | select database, reason, stderr, exitcode
+}
+
