@@ -35,10 +35,11 @@ pub enum Token {
     EqEq,
     NotEq,
 
-    Plus,  // +
-    Minus, // -
-    Star,  // *
-    Slash, // /
+    Plus,      // +
+    Minus,     // -
+    Star,      // *
+    Slash,     // /
+    Backslash, // \
 
     // Gt,         // >
     // Lt,         // <
@@ -247,6 +248,11 @@ impl Lexer {
                     }
                 }
 
+                '\\' => {
+                    self.advance();
+                    tokens.push(self.make_token(Token::Backslash));
+                }
+
                 _ => {
                     return Err(self.error(&format!("Unexpected character '{}'", ch)));
                 }
@@ -281,13 +287,16 @@ impl Lexer {
                     self.advance();
                     if let Some(escaped) = self.peek() {
                         self.advance();
-                        value.push(match escaped {
-                            'n' => '\n',
-                            't' => '\t',
-                            '"' => '"',
-                            '\\' => '\\',
-                            other => other,
-                        });
+                        match escaped {
+                            'n' => value.push('\n'),
+                            't' => value.push('\t'),
+                            '"' => value.push('"'),
+                            '\\' => value.push('\\'),
+                            other => {
+                                value.push('\\');
+                                value.push(other);
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -478,6 +487,22 @@ files | where size > 1mb | select name, size
                 Token::Comma,
                 Token::String("b".into()),
                 Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_unknown_backslash_escapes_in_strings() {
+        let tokens = Lexer::new(r#""C:\Program Files\Tool\Tool.exe""#)
+            .tokenize()
+            .unwrap();
+        let kinds: Vec<Token> = tokens.into_iter().map(|token| token.token).collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                Token::String(r"C:\Program Files\Tool\Tool.exe".into()),
                 Token::Eof,
             ]
         );

@@ -1,0 +1,14 @@
+requires {
+  proc.exec
+  workspace.read
+  fs.write
+}
+
+let result = exec "echo zen-result"
+
+result
+  | select success, exitcode, stdout, stderr
+  | to-json
+  | save "dist/result.json"
+
+workspace.read "dist/result.json" | from-json | echo table

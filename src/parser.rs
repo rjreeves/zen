@@ -678,12 +678,12 @@ impl Parser {
             );
         let mut args = Vec::new();
         while if command_style {
-            self.is_command_arg_start()
+            self.is_command_arg_start_for(&name[0], args.is_empty())
         } else {
             self.is_call_arg_start()
         } {
             if command_style {
-                args.push(self.parse_command_arg()?);
+                args.push(self.parse_command_arg_for(&name[0], args.is_empty())?);
             } else {
                 args.push(self.parse_expr()?);
             }
@@ -800,6 +800,11 @@ impl Parser {
         self.is_expr_start() || matches!(self.current(), Token::Minus)
     }
 
+    fn is_command_arg_start_for(&self, command: &str, first_arg: bool) -> bool {
+        self.is_command_arg_start()
+            || (command == "exec" && first_arg && self.starts_exec_path_like_token())
+    }
+
     fn parse_command_arg(&mut self) -> Result<Expr, String> {
         if matches!(self.current(), Token::Minus) {
             self.advance();
@@ -814,6 +819,78 @@ impl Parser {
         }
 
         self.parse_expr()
+    }
+
+    fn parse_command_arg_for(&mut self, command: &str, first_arg: bool) -> Result<Expr, String> {
+        if command == "exec" && first_arg && self.starts_exec_path_like_token() {
+            return self.parse_exec_command();
+        }
+
+        self.parse_command_arg()
+    }
+
+    fn parse_exec_command(&mut self) -> Result<Expr, String> {
+        match self.current().clone() {
+            Token::String(value) => {
+                self.advance();
+                Ok(Expr::String(value))
+            }
+            Token::Ident(_) if !self.starts_exec_path_like_token() => self.parse_command_arg(),
+            Token::Ident(_) | Token::Dot | Token::Slash | Token::Backslash => {
+                Ok(Expr::String(self.parse_path_like_word()?))
+            }
+            _ => Err(self.error("Expected command name or executable path after exec")),
+        }
+    }
+
+    fn starts_exec_path_like_token(&self) -> bool {
+        match self.current() {
+            Token::Dot | Token::Slash | Token::Backslash => true,
+            Token::Ident(_) => matches!(
+                self.tokens.get(self.pos + 1).map(|token| &token.token),
+                Some(Token::Colon | Token::Dot | Token::Slash | Token::Backslash)
+            ),
+            _ => false,
+        }
+    }
+
+    fn parse_path_like_word(&mut self) -> Result<String, String> {
+        let mut out = String::new();
+        let mut allow_segment = true;
+
+        loop {
+            match self.current().clone() {
+                Token::Ident(value) if allow_segment => {
+                    out.push_str(&value);
+                    self.advance();
+                    allow_segment = false;
+                }
+                Token::Number(value) if allow_segment => {
+                    out.push_str(&value.to_string());
+                    self.advance();
+                    allow_segment = false;
+                }
+                Token::Dot | Token::Slash | Token::Backslash | Token::Colon => {
+                    let ch = match self.current() {
+                        Token::Dot => '.',
+                        Token::Slash => '/',
+                        Token::Backslash => '\\',
+                        Token::Colon => ':',
+                        _ => unreachable!(),
+                    };
+                    out.push(ch);
+                    self.advance();
+                    allow_segment = true;
+                }
+                _ => break,
+            }
+        }
+
+        if out.is_empty() {
+            return Err(self.error("Expected command name or executable path after exec"));
+        }
+
+        Ok(out)
     }
 
     fn parse_call_config(&mut self) -> Result<CallConfig, String> {
@@ -959,6 +1036,25 @@ impl Parser {
             Token::Dollar => Ok(Expr::Variable(self.expect_ident()?)),
 
             Token::Ident(name) => {
+                if name == "exec" && self.starts_exec_path_like_token() {
+                    let mut args = Vec::new();
+                    while self.is_command_arg_start_for(&name, args.is_empty()) {
+                        args.push(self.parse_command_arg_for(&name, args.is_empty())?);
+                    }
+
+                    let config = if self.current_starts_call_config() {
+                        Some(self.parse_call_config()?)
+                    } else {
+                        None
+                    };
+
+                    return Ok(Expr::Call(FunctionCall {
+                        name: vec![name],
+                        args,
+                        config,
+                    }));
+                }
+
                 if matches!(self.current(), Token::Dot) {
                     let mut parts = vec![name];
 
@@ -997,8 +1093,8 @@ impl Parser {
                         | "sleep"
                 ) {
                     let mut args = Vec::new();
-                    while self.is_command_arg_start() {
-                        args.push(self.parse_command_arg()?);
+                    while self.is_command_arg_start_for(&name, args.is_empty()) {
+                        args.push(self.parse_command_arg_for(&name, args.is_empty())?);
                     }
 
                     let config = if self.current_starts_call_config() {
@@ -1249,6 +1345,40 @@ mod tests {
         match parser.parse_program() {
             Ok(_) => panic!("Expected parse error"),
             Err(err) => err,
+        }
+    }
+
+    fn parse_exec_args(src: &str) -> Vec<String> {
+        let program = parse(src);
+        match program.statements.as_slice() {
+            [Stmt::Expr(Expr::Call(call))] if call.name == vec!["exec".to_string()] => call
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    Expr::String(value) => value.clone(),
+                    Expr::Ident(value) => value.clone(),
+                    Expr::Literal(Literal::String(value)) => value.clone(),
+                    Expr::Literal(Literal::Number(value)) => value.to_string(),
+                    other => panic!("Unexpected exec arg expression: {:?}", expr_name(other)),
+                })
+                .collect(),
+            _ => panic!("Expected exec call"),
+        }
+    }
+
+    fn expr_name(expr: &Expr) -> &'static str {
+        match expr {
+            Expr::Ident(_) => "ident",
+            Expr::Variable(_) => "variable",
+            Expr::Number(_) => "number",
+            Expr::String(_) => "string",
+            Expr::Bool(_) => "bool",
+            Expr::Literal(_) => "literal",
+            Expr::List(_) => "list",
+            Expr::Object(_) => "object",
+            Expr::Call(_) => "call",
+            Expr::Binary { .. } => "binary",
+            Expr::Unary { .. } => "unary",
         }
     }
 
@@ -1564,6 +1694,57 @@ mod tests {
             }
             _ => panic!("Expected data pipeline"),
         }
+    }
+
+    #[test]
+    fn parses_exec_relative_executable_path() {
+        let args = parse_exec_args("exec ./binn/firewisemail/FirewiseMail.App.exe\n");
+
+        assert_eq!(args, vec!["./binn/firewisemail/FirewiseMail.App.exe"]);
+    }
+
+    #[test]
+    fn parses_exec_windows_relative_executable_path() {
+        let args = parse_exec_args(r"exec .\binn\firewisemail\FirewiseMail.App.exe");
+
+        assert_eq!(args, vec![r".\binn\firewisemail\FirewiseMail.App.exe"]);
+    }
+
+    #[test]
+    fn parses_exec_quoted_windows_executable_path() {
+        let args = parse_exec_args(r#"exec "C:\Program Files\FirewiseMail\FirewiseMail.App.exe""#);
+
+        assert_eq!(
+            args,
+            vec![r"C:\Program Files\FirewiseMail\FirewiseMail.App.exe"]
+        );
+    }
+
+    #[test]
+    fn parses_exec_path_with_timeout_option() {
+        let args = parse_exec_args("exec ./tools/my-tool.exe --version timeout 10s\n");
+
+        assert_eq!(
+            args,
+            vec!["./tools/my-tool.exe", "--version", "timeout", "10", "s"]
+        );
+    }
+
+    #[test]
+    fn parses_exec_path_with_workdir_option() {
+        let args = parse_exec_args("exec ./tools/my-tool.exe workdir \".\"\n");
+
+        assert_eq!(args, vec!["./tools/my-tool.exe", "workdir", "."]);
+    }
+
+    #[test]
+    fn parses_existing_exec_identifier_syntax() {
+        let args = parse_exec_args("exec cargo test retry 3 timeout 30s\n");
+
+        assert_eq!(
+            args,
+            vec!["cargo", "test", "retry", "3", "timeout", "30", "s"]
+        );
     }
 
     #[test]
