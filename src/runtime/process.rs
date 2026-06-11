@@ -2,6 +2,7 @@ use crate::interrupt;
 use crate::runtime::values::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -205,10 +206,30 @@ fn command_builder_argv(
         return Err("External command resolved to an empty argv".into());
     };
 
+    let program = resolve_argv_program(program, workdir);
     let mut cmd = Command::new(program);
     cmd.args(args);
     apply_command_options(&mut cmd, workdir, env)?;
     Ok(cmd)
+}
+
+fn resolve_argv_program(program: &str, workdir: Option<&str>) -> PathBuf {
+    let path = Path::new(program);
+    if path.is_absolute() || !is_path_like_program(program) {
+        return path.to_path_buf();
+    }
+
+    workdir
+        .map(|dir| Path::new(dir).join(path))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn is_path_like_program(program: &str) -> bool {
+    program.starts_with('.')
+        || program.starts_with('/')
+        || program.starts_with('\\')
+        || program.contains('/')
+        || program.contains('\\')
 }
 
 fn command_builder_shell(
@@ -292,4 +313,34 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     raw.parse::<u64>()
         .map(Duration::from_secs)
         .map_err(|_| format!("Invalid timeout duration '{}'", raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn argv_exec_resolves_relative_program_against_workdir() {
+        let current_exe = env::current_exe().unwrap();
+        let workdir = current_exe.parent().unwrap().to_string_lossy().into_owned();
+        let program = format!("./{}", current_exe.file_name().unwrap().to_string_lossy());
+
+        let output = exec_command(ExecRequest {
+            command: format!("{} --help", program),
+            argv: Some(vec![program, "--help".into()]),
+            attempts: 1,
+            timeout: Some(Duration::from_secs(10)),
+            wait_children: false,
+            workdir: Some(workdir),
+            env: HashMap::new(),
+        })
+        .unwrap();
+
+        let Value::Object(map) = output else {
+            panic!("Expected exec output object");
+        };
+
+        assert!(matches!(map.get("success"), Some(Value::Bool(true))));
+    }
 }

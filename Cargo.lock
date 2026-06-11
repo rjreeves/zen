@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "zen"
-version = "1.0.3"
+version = "1.0.6"
 dependencies = [
  "chrono",
  "clap",

@@ -1871,7 +1871,7 @@ impl Executor {
 
         Ok(ExecRequest {
             command: command_parts.join(" "),
-            argv: None,
+            argv: Some(command_parts),
             attempts,
             timeout,
             wait_children,
@@ -7289,6 +7289,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(request.command, "tool");
+        assert_eq!(request.argv, Some(vec!["tool".into()]));
         assert!(request.wait_children);
         assert_eq!(request.timeout, Some(Duration::from_secs(1)));
     }
@@ -7310,6 +7311,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(request.command, "tool");
+        assert_eq!(request.argv, Some(vec!["tool".into()]));
         assert!(request
             .workdir
             .as_deref()
@@ -7375,6 +7377,29 @@ mod tests {
             .unwrap()
             .replace('\\', "/")
             .ends_with("/src"));
+    }
+
+    #[test]
+    fn exec_request_preserves_variable_command_path_as_argv() {
+        let mut executor = executor_with_exec_permission();
+        executor.ctx.vars.insert(
+            "x".into(),
+            Value::String("./binn/firewisemail/FirewiseMail.App.exe".into()),
+        );
+
+        let request = executor
+            .exec_request_from_call(FunctionCall {
+                name: vec!["exec".into()],
+                args: vec![Expr::Variable("x".into())],
+                config: None,
+            })
+            .unwrap();
+
+        assert_eq!(request.command, "./binn/firewisemail/FirewiseMail.App.exe");
+        assert_eq!(
+            request.argv,
+            Some(vec!["./binn/firewisemail/FirewiseMail.App.exe".into()])
+        );
     }
 
     #[test]
