@@ -12,7 +12,7 @@ pub enum Stmt {
 
     Assignment {
         name: String,
-        expr: Expr,
+        value: AssignmentValue,
     },
 
     If {
@@ -31,6 +31,11 @@ pub enum Stmt {
     Pipeline(Pipeline),
 
     Expr(Expr),
+}
+
+pub enum AssignmentValue {
+    Expr(Expr),
+    Pipeline(Pipeline),
 }
 
 pub struct Pipeline {

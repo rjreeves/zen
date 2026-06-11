@@ -215,8 +215,8 @@ impl Executor {
                 Ok(())
             }
 
-            Stmt::Assignment { name, expr } => {
-                let value = self.eval_value_expr(&expr)?;
+            Stmt::Assignment { name, value } => {
+                let value = self.eval_assignment_value(value)?;
                 self.ctx.vars.insert(name.clone(), value.clone());
                 self.env.insert(name, value);
                 Ok(())
@@ -284,8 +284,8 @@ impl Executor {
     fn execute_stmt_capture(&mut self, stmt: Stmt) -> Result<Value, String> {
         match stmt {
             Stmt::Requires(_caps) => Ok(Value::Null),
-            Stmt::Assignment { name, expr } => {
-                let value = self.eval_value_expr(&expr)?;
+            Stmt::Assignment { name, value } => {
+                let value = self.eval_assignment_value(value)?;
                 self.ctx.vars.insert(name.clone(), value.clone());
                 self.env.insert(name, value.clone());
                 Ok(value)
@@ -351,6 +351,13 @@ impl Executor {
             last = self.execute_stmt_capture(stmt)?;
         }
         Ok(last)
+    }
+
+    fn eval_assignment_value(&mut self, value: AssignmentValue) -> Result<Value, String> {
+        match value {
+            AssignmentValue::Expr(expr) => self.eval_value_expr(&expr),
+            AssignmentValue::Pipeline(pipeline) => self.eval_pipeline(pipeline),
+        }
     }
 
     fn eval_value_expr(&mut self, expr: &Expr) -> Result<Value, String> {
@@ -1869,8 +1876,14 @@ impl Executor {
             return Err("Expected command after exec".into());
         }
 
+        let command = command_parts
+            .iter()
+            .map(|part| Self::shell_arg(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+
         Ok(ExecRequest {
-            command: command_parts.join(" "),
+            command,
             argv: Some(command_parts),
             attempts,
             timeout,
@@ -4123,8 +4136,15 @@ impl Executor {
                 };
 
                 match input {
-                    Value::Null => Ok(Value::String(self.now().format(&pattern).to_string())),
-                    value => Ok(Value::String(Self::format_time_value(value, &pattern)?)),
+                    Value::Null => Ok(Value::String(
+                        self.now()
+                            .with_timezone(&Local)
+                            .format(&pattern)
+                            .to_string(),
+                    )),
+                    value => Ok(Value::String(Self::format_local_time_value(
+                        value, &pattern,
+                    )?)),
                 }
             }
             "stamp" => {
@@ -4346,25 +4366,6 @@ impl Executor {
                 Ok(Value::List(stamped))
             }
             other => Ok(other),
-        }
-    }
-
-    fn format_time_value(value: Value, pattern: &str) -> Result<String, String> {
-        match value {
-            Value::Number(n) => {
-                let seconds = n as i64;
-                let dt = Utc
-                    .timestamp_opt(seconds, 0)
-                    .single()
-                    .ok_or_else(|| format!("Invalid epoch seconds '{}'", seconds))?;
-                Ok(dt.format(pattern).to_string())
-            }
-            Value::String(s) => {
-                let dt = DateTime::parse_from_rfc3339(&s)
-                    .map_err(|e| format!("Expected RFC3339 timestamp string: {}", e))?;
-                Ok(dt.with_timezone(&Utc).format(pattern).to_string())
-            }
-            _ => Err("time format expects a timestamp string or epoch seconds".into()),
         }
     }
 
@@ -6395,6 +6396,14 @@ mod tests {
             )
             .unwrap();
 
+        let expected_year = Utc
+            .timestamp_opt(1_778_762_096, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%Y")
+            .to_string();
+
         match executor
             .time_value(
                 vec![Expr::Ident("format".into()), Expr::String("%Y".into())],
@@ -6402,7 +6411,7 @@ mod tests {
             )
             .unwrap()
         {
-            Value::String(value) => assert_eq!(value, "2026"),
+            Value::String(value) => assert_eq!(value, expected_year),
             other => panic!("Expected frozen formatted time, got {:?}", other),
         }
 
@@ -6635,6 +6644,36 @@ mod tests {
         );
         assert!(!map.contains_key("started_at"));
         assert!(!map.contains_key("ended_at"));
+    }
+
+    #[test]
+    fn assignment_can_capture_pipeline_result() {
+        let mut executor = executor();
+
+        executor
+            .eval_call(FunctionCall {
+                name: vec!["time".into(), "freeze".into()],
+                args: vec![Expr::String("2026-05-14T12:34:56Z".into())],
+                config: None,
+            })
+            .unwrap();
+
+        let result = executor
+            .execute_capture(parse("let t = time.now | time.format \"%I:%M:%S %p\"\n"))
+            .unwrap();
+        let expected = Utc
+            .timestamp_opt(1_778_762_096, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%I:%M:%S %p")
+            .to_string();
+
+        assert_eq!(result.as_string(), Some(expected.as_str()));
+        assert_eq!(
+            executor.ctx.vars.get("t").and_then(Value::as_string),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -7399,6 +7438,29 @@ mod tests {
         assert_eq!(
             request.argv,
             Some(vec!["./binn/firewisemail/FirewiseMail.App.exe".into()])
+        );
+    }
+
+    #[test]
+    fn exec_request_preserves_quoted_text_as_single_argv_arg() {
+        let mut executor = executor_with_exec_permission();
+
+        let request = executor
+            .exec_request_from_call(FunctionCall {
+                name: vec!["exec".into()],
+                args: vec![
+                    Expr::Ident("program".into()),
+                    Expr::Ident("with".into()),
+                    Expr::String("my app".into()),
+                ],
+                config: None,
+            })
+            .unwrap();
+
+        assert_eq!(request.command, "program with \"my app\"");
+        assert_eq!(
+            request.argv,
+            Some(vec!["program".into(), "with".into(), "my app".into()])
         );
     }
 

@@ -229,8 +229,13 @@ impl Parser {
     fn parse_assignment(&mut self) -> Result<Stmt, String> {
         let name = self.expect_ident()?;
         self.expect(Token::Equals)?;
-        let expr = self.parse_expression()?;
-        Ok(Stmt::Assignment { name, expr })
+        let base = self.parse_expression()?;
+        let value = if matches!(self.current(), Token::Pipe) {
+            AssignmentValue::Pipeline(self.parse_pipeline_from_base(base)?)
+        } else {
+            AssignmentValue::Expr(base)
+        };
+        Ok(Stmt::Assignment { name, value })
     }
 
     fn parse_let_assignment(&mut self) -> Result<Stmt, String> {
@@ -240,6 +245,10 @@ impl Parser {
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, String> {
         let base = self.parse_expression()?;
+        self.parse_pipeline_from_base(base)
+    }
+
+    fn parse_pipeline_from_base(&mut self, base: Expr) -> Result<Pipeline, String> {
         let mut stages = Vec::new();
 
         loop {
@@ -1471,11 +1480,32 @@ mod tests {
         let program = parse("let parts = [\"a\", \"b\", \"c\"]\n");
 
         match program.statements.as_slice() {
-            [Stmt::Assignment { name, expr }] => {
+            [Stmt::Assignment { name, value }] => {
                 assert_eq!(name, "parts");
-                match expr {
-                    Expr::List(items) => assert_eq!(items.len(), 3),
+                match value {
+                    AssignmentValue::Expr(Expr::List(items)) => assert_eq!(items.len(), 3),
                     _ => panic!("Expected list literal"),
+                }
+            }
+            _ => panic!("Expected assignment"),
+        }
+    }
+
+    #[test]
+    fn parses_pipeline_assignment() {
+        let program = parse("let t = time.now | time.format \"%I:%M:%S %p\"\n");
+
+        match program.statements.as_slice() {
+            [Stmt::Assignment { name, value }] => {
+                assert_eq!(name, "t");
+                match value {
+                    AssignmentValue::Pipeline(pipeline) => {
+                        assert!(
+                            matches!(&pipeline.base, Expr::Call(call) if call.name == vec!["time".to_string(), "now".to_string()])
+                        );
+                        assert_eq!(pipeline.stages.len(), 1);
+                    }
+                    _ => panic!("Expected pipeline assignment"),
                 }
             }
             _ => panic!("Expected assignment"),
@@ -1489,10 +1519,10 @@ mod tests {
         );
 
         match program.statements.as_slice() {
-            [Stmt::Assignment { name, expr }] => {
+            [Stmt::Assignment { name, value }] => {
                 assert_eq!(name, "user");
-                match expr {
-                    Expr::Object(entries) => {
+                match value {
+                    AssignmentValue::Expr(Expr::Object(entries)) => {
                         assert_eq!(entries.len(), 6);
                         assert_eq!(entries[0].0, "name");
                         assert_eq!(entries[4].0, "display-name");
@@ -1569,7 +1599,7 @@ mod tests {
 
         match program.statements.as_slice() {
             [Stmt::Assignment {
-                expr: Expr::Object(entries),
+                value: AssignmentValue::Expr(Expr::Object(entries)),
                 ..
             }] => {
                 assert_eq!(entries.len(), 2);
@@ -1581,7 +1611,6 @@ mod tests {
             _ => panic!("Expected object assignment"),
         }
     }
-
     #[test]
     fn parses_list_literal_as_dotted_call_argument() {
         let program = parse("string.join [\"a\", \"b\", \"c\"] \",\"\n");

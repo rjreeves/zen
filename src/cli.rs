@@ -1,4 +1,4 @@
-use crate::ast::{Expr, PipeStage, Stmt};
+use crate::ast::{AssignmentValue, Expr, PipeStage, Pipeline, Stmt};
 use crate::audit::{current_timestamp, write_entry, AuditEntry};
 use crate::interrupt;
 use crate::lexer::Lexer;
@@ -1751,11 +1751,11 @@ fn print_statement(stmt: &Stmt, indent: usize) {
             println!("{}Requires: {:?}", pad, caps);
         }
 
-        Stmt::Assignment { name, expr } => {
+        Stmt::Assignment { name, value } => {
             println!("{}Assignment:", pad);
             println!("{}  name: {}", pad, name);
             println!("{}  value:", pad);
-            print_expr(expr, indent + 2);
+            print_assignment_value(value, indent + 2);
         }
 
         Stmt::If {
@@ -1806,21 +1806,33 @@ fn print_statement(stmt: &Stmt, indent: usize) {
         }
 
         Stmt::Pipeline(pipeline) => {
-            println!("{}Pipeline:", pad);
-            println!("{}  base:", pad);
-            print_expr(&pipeline.base, indent + 2);
-
-            println!("{}  stages:", pad);
-
-            for stage in &pipeline.stages {
-                print_stage(stage, indent + 2);
-            }
+            print_pipeline(pipeline, indent);
         }
 
         Stmt::Expr(expr) => {
             println!("{}Expression:", pad);
             print_expr(expr, indent + 1);
         }
+    }
+}
+
+fn print_assignment_value(value: &AssignmentValue, indent: usize) {
+    match value {
+        AssignmentValue::Expr(expr) => print_expr(expr, indent),
+        AssignmentValue::Pipeline(pipeline) => print_pipeline(pipeline, indent),
+    }
+}
+
+fn print_pipeline(pipeline: &Pipeline, indent: usize) {
+    let pad = "  ".repeat(indent);
+    println!("{}Pipeline:", pad);
+    println!("{}  base:", pad);
+    print_expr(&pipeline.base, indent + 2);
+
+    println!("{}  stages:", pad);
+
+    for stage in &pipeline.stages {
+        print_stage(stage, indent + 2);
     }
 }
 

@@ -2,6 +2,7 @@ use crate::interrupt;
 use crate::runtime::values::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -53,7 +54,9 @@ fn run_command_spawned(request: &ExecRequest) -> Result<ExecOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(original_error) if request.argv.is_some() => {
+        Err(original_error)
+            if request.argv.is_some() && original_error.kind() == ErrorKind::NotFound =>
+        {
             let mut fallback =
                 command_builder_shell(&request.command, request.workdir.as_deref(), &request.env)?;
             fallback.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -239,7 +242,8 @@ fn command_builder_shell(
 ) -> Result<Command, String> {
     let mut cmd = if cfg!(windows) {
         let mut cmd = Command::new("cmd");
-        cmd.arg("/C").arg(command);
+        cmd.arg("/S").arg("/C");
+        push_windows_raw_arg(&mut cmd, command);
         cmd
     } else {
         let mut cmd = Command::new("sh");
@@ -250,6 +254,16 @@ fn command_builder_shell(
     apply_command_options(&mut cmd, workdir, env)?;
     Ok(cmd)
 }
+
+#[cfg(windows)]
+fn push_windows_raw_arg(cmd: &mut Command, arg: &str) {
+    use std::os::windows::process::CommandExt;
+
+    cmd.raw_arg(arg);
+}
+
+#[cfg(not(windows))]
+fn push_windows_raw_arg(_cmd: &mut Command, _arg: &str) {}
 
 fn apply_command_options(
     cmd: &mut Command,
@@ -342,5 +356,79 @@ mod tests {
         };
 
         assert!(matches!(map.get("success"), Some(Value::Bool(true))));
+    }
+
+    #[test]
+    fn argv_exec_keeps_first_program_token_with_spaces_intact() {
+        let current_exe = env::current_exe().unwrap();
+        let workdir_path = env::temp_dir().join(format!("zen argv space {}", std::process::id()));
+        fs::create_dir_all(&workdir_path).unwrap();
+
+        let program_name = if cfg!(windows) {
+            "my app.exe"
+        } else {
+            "my app"
+        };
+        let copied_exe = workdir_path.join(program_name);
+        fs::copy(&current_exe, &copied_exe).unwrap();
+
+        let output = exec_command(ExecRequest {
+            command: format!("\"./{}\" --help", program_name),
+            argv: Some(vec![format!("./{}", program_name), "--help".into()]),
+            attempts: 1,
+            timeout: Some(Duration::from_secs(10)),
+            wait_children: false,
+            workdir: Some(workdir_path.to_string_lossy().into_owned()),
+            env: HashMap::new(),
+        })
+        .unwrap();
+
+        let Value::Object(map) = output else {
+            panic!("Expected exec output object");
+        };
+
+        assert!(matches!(map.get("success"), Some(Value::Bool(true))));
+        let _ = fs::remove_file(copied_exe);
+        let _ = fs::remove_dir(workdir_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn argv_exec_shell_fallback_preserves_spaced_args_for_cmd_helpers() {
+        let workdir_path = env::temp_dir().join(format!("zen cmd fallback {}", std::process::id()));
+        fs::create_dir_all(&workdir_path).unwrap();
+        let helper = workdir_path.join("msgbox.cmd");
+        fs::write(
+            &helper,
+            "@echo off\r\necho first=[%~1]\r\necho second=[%~2]\r\necho third=[%~3]\r\n",
+        )
+        .unwrap();
+
+        let output = exec_command(ExecRequest {
+            command: "msgbox \"a b\" \"D \"".into(),
+            argv: Some(vec!["msgbox".into(), "a b".into(), "D ".into()]),
+            attempts: 1,
+            timeout: Some(Duration::from_secs(10)),
+            wait_children: false,
+            workdir: Some(workdir_path.to_string_lossy().into_owned()),
+            env: HashMap::new(),
+        })
+        .unwrap();
+
+        let Value::Object(map) = output else {
+            panic!("Expected exec output object");
+        };
+
+        assert!(matches!(map.get("success"), Some(Value::Bool(true))));
+        match map.get("stdout") {
+            Some(Value::String(value)) => assert!(
+                value.contains("first=[a b]") && value.contains("second=[D"),
+                "expected spaced args to stay intact, got {value:?}"
+            ),
+            other => panic!("Expected stdout string, got {:?}", other),
+        }
+
+        let _ = fs::remove_file(helper);
+        let _ = fs::remove_dir(workdir_path);
     }
 }

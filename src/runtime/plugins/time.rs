@@ -38,11 +38,11 @@ static TIME_DOCS: &[CommandDoc] = &[
     },
     CommandDoc {
         command: "time.format",
-        summary: "Formats the current time or pipeline timestamp.",
+        summary: "Formats the current time or pipeline timestamp for local display.",
         usage: "time.format [pattern]",
         examples: &[
             "time.format \"%Y-%m-%d\"",
-            "time.now | time.format \"%H:%M\"",
+            "time.now | time.format \"%I:%M:%S %p\"",
         ],
     },
     CommandDoc {
