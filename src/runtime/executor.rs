@@ -128,6 +128,13 @@ impl Executor {
         Self::new_with_plugins(permissions, builtin_plugins())
     }
 
+    pub fn new_with_permissions_and_workspace(
+        permissions: PermissionSet,
+        workspace_root: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::new_with_plugins_and_workspace(permissions, builtin_plugins(), workspace_root)
+    }
+
     pub fn new_with_plugins(permissions: PermissionSet, plugins: Vec<Arc<dyn ZenPlugin>>) -> Self {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let workspace_root = Self::discover_workspace_root(&cwd);
@@ -141,6 +148,42 @@ impl Executor {
             cwd,
             plugins,
         }
+    }
+
+    pub fn new_with_plugins_and_workspace(
+        permissions: PermissionSet,
+        plugins: Vec<Arc<dyn ZenPlugin>>,
+        workspace_root: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let mut executor = Self::new_with_plugins(permissions, plugins);
+
+        if let Some(workspace_root) = workspace_root {
+            let root = fs::canonicalize(&workspace_root).map_err(|e| {
+                format!(
+                    "Invalid workspace '{}': {}",
+                    workspace_root.to_string_lossy(),
+                    e
+                )
+            })?;
+            let root = Self::normalize_canonical_path(root);
+
+            if !root.is_dir() {
+                return Err(format!(
+                    "Invalid workspace '{}': not a directory",
+                    workspace_root.to_string_lossy()
+                ));
+            }
+
+            let cwd = env::current_dir().unwrap_or_else(|_| root.clone());
+            executor.cwd = if cwd.starts_with(&root) {
+                cwd
+            } else {
+                root.clone()
+            };
+            executor.workspace_root = root;
+        }
+
+        Ok(executor)
     }
 
     pub fn grant_permissions(&mut self, required: &[(String, String)]) {
@@ -2047,6 +2090,21 @@ impl Executor {
                 return start.to_path_buf();
             }
         }
+    }
+
+    fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let text = path.to_string_lossy();
+            if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{rest}"));
+            }
+            if let Some(rest) = text.strip_prefix(r"\\?\") {
+                return PathBuf::from(rest);
+            }
+        }
+
+        path
     }
 
     fn workspace_find_files(&self, pattern: &str) -> Result<Value, String> {
@@ -4657,6 +4715,16 @@ mod tests {
         Executor::new_with_permissions(PermissionSet::new(&vec![("proc".into(), "exec".into())]))
     }
 
+    fn temp_workspace_root(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir()
+            .join("zen-tests")
+            .join(format!("{name}-{unique}"))
+    }
+
     fn parse(src: &str) -> Program {
         let tokens = Lexer::new(src).tokenize().unwrap();
         let mut parser = Parser::new(tokens, src);
@@ -4705,6 +4773,40 @@ mod tests {
             .expect_err("expected unclosed quote error");
 
         assert!(error.contains("unterminated"));
+    }
+
+    #[test]
+    fn explicit_workspace_root_sets_root_and_initial_cwd() {
+        let root = temp_workspace_root("explicit-workspace");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let executor = Executor::new_with_permissions_and_workspace(
+            PermissionSet::new(&Vec::new()),
+            Some(root.clone()),
+        )
+        .unwrap();
+        let canonical_root =
+            Executor::normalize_canonical_path(std::fs::canonicalize(&root).unwrap());
+
+        assert_eq!(executor.workspace_root_path(), canonical_root.as_path());
+        assert_eq!(executor.cwd(), canonical_root.as_path());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_workspace_root_must_exist() {
+        let root = temp_workspace_root("missing-workspace");
+
+        let result = Executor::new_with_permissions_and_workspace(
+            PermissionSet::new(&Vec::new()),
+            Some(root),
+        );
+        let Err(err) = result else {
+            panic!("expected invalid workspace error");
+        };
+
+        assert!(err.contains("Invalid workspace"));
     }
 
     fn plugin_inventory_has(value: &Value, name: &str) -> bool {

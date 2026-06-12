@@ -167,9 +167,10 @@ On startup, the REPL runs startup files when they exist:
 
 ```text
 <config-dir>\zen\startup.fg
-.zen\startup.fg
+<workspace-root>\.zen\startup.fg
 ```
 
+Use `zen --workspace <path> repl` to choose the workspace root explicitly.
 Use startup files for session setup such as `let` variables and `requires` blocks.
 Use `:startup` inside the REPL to show whether each startup file was loaded, missing, or failed.
 Use `:reload` to re-run startup files without restarting the REPL.

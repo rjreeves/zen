@@ -9,10 +9,15 @@ mod runtime;
 mod terminal;
 
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "zen", version, about = "Zen v9.0")]
 struct Args {
+    /// Override the workspace root used for state, plugins, workflows, and startup files
+    #[arg(long, global = true, value_name = "PATH")]
+    workspace: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -53,7 +58,10 @@ fn main() {
     env_logger::init();
     let args = Args::parse();
 
-    if let Err(e) = cli::handle_command(args.command.unwrap_or(Commands::Repl { yes: false })) {
+    if let Err(e) = cli::handle_command(
+        args.command.unwrap_or(Commands::Repl { yes: false }),
+        args.workspace,
+    ) {
         eprintln!("\n❌ {}\n", e);
         std::process::exit(1);
     }

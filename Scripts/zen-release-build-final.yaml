@@ -49,7 +49,7 @@ steps:
 
   - name: zip-release
     if: outputs.readme.success == true
-    zen: archive.zip "dist/zen-win64.zip" "dist/zen.exe" "dist/README.md" ".zen" exclude ".zen/runtime.db" ".zen/state.json" ".zen/schedules.json"
+    zen: archive.zip "dist/zen-win64.zip" "dist/zen.exe" "dist/README.md" ".zen" exclude ".zen/runtime.db" ".zen/state.json" ".zen/schedules.json" ".zen/build-number"
     save_as: zip
     artifacts:
       - name: release_zip

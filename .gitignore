@@ -7,3 +7,4 @@ obj/
 .zen/state.json
 .zen/schedules.json
 .zen/events.log
+.zen/build-number

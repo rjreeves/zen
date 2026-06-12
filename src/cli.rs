@@ -22,31 +22,41 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub fn handle_command(cmd: Commands) -> Result<(), String> {
+#[derive(Clone, Debug, Default)]
+pub struct CliOptions {
+    pub workspace: Option<PathBuf>,
+}
+
+pub fn handle_command(cmd: Commands, workspace: Option<PathBuf>) -> Result<(), String> {
+    let options = CliOptions { workspace };
     match cmd {
-        Commands::Run { script, yes } => run_script(&script, yes),
-        Commands::Repl { yes } => run_repl(yes),
+        Commands::Run { script, yes } => run_script(&script, yes, &options),
+        Commands::Repl { yes } => run_repl(yes, &options),
         Commands::Explain { script } => explain_script(&script),
         Commands::Audit => show_audit(),
-        Commands::Runs => show_workflow_runs(),
-        Commands::RunStatus { run_id } => show_workflow_run_status(&run_id),
-        Commands::Resume { run_id, yes } => resume_workflow_run(&run_id, yes),
+        Commands::Runs => show_workflow_runs(&options),
+        Commands::RunStatus { run_id } => show_workflow_run_status(&run_id, &options),
+        Commands::Resume { run_id, yes } => resume_workflow_run(&run_id, yes, &options),
         Commands::Version => show_version(),
-        Commands::OneOff(parts) => run_one_off(parts),
+        Commands::OneOff(parts) => run_one_off(parts, &options),
     }
 }
 
-fn run_script(path: &str, auto_yes: bool) -> Result<(), String> {
+fn new_executor(permissions: PermissionSet, options: &CliOptions) -> Result<Executor, String> {
+    Executor::new_with_permissions_and_workspace(permissions, options.workspace.clone())
+}
+
+fn run_script(path: &str, auto_yes: bool, options: &CliOptions) -> Result<(), String> {
     let start = Instant::now();
 
     if is_workflow_path(path) {
-        return run_workflow_file(path, auto_yes, start);
+        return run_workflow_file(path, auto_yes, start, options);
     }
 
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read script '{}': {}", path, e))?;
 
-    run_source(&src, path, auto_yes, start)
+    run_source(&src, path, auto_yes, start, options)
 }
 
 fn is_workflow_path(path: &str) -> bool {
@@ -58,8 +68,13 @@ fn is_workflow_path(path: &str) -> bool {
     )
 }
 
-fn run_workflow_file(path: &str, auto_yes: bool, start: Instant) -> Result<(), String> {
-    run_workflow_file_with_run_id(path, auto_yes, start, None)
+fn run_workflow_file(
+    path: &str,
+    auto_yes: bool,
+    start: Instant,
+    options: &CliOptions,
+) -> Result<(), String> {
+    run_workflow_file_with_run_id(path, auto_yes, start, None, options)
 }
 
 fn run_workflow_file_with_run_id(
@@ -67,6 +82,7 @@ fn run_workflow_file_with_run_id(
     auto_yes: bool,
     start: Instant,
     run_id: Option<&str>,
+    options: &CliOptions,
 ) -> Result<(), String> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read workflow '{}': {}", path, e))?;
@@ -95,7 +111,7 @@ fn run_workflow_file_with_run_id(
         println!("✔ Auto-approved (--yes)");
     }
 
-    let mut executor = Executor::new_with_permissions(permissions);
+    let mut executor = new_executor(permissions, options)?;
     let result = if let Some(run_id) = run_id {
         executor.workflow_resume_persisted(workflow, path, run_id)
     } else {
@@ -127,8 +143,8 @@ fn run_workflow_file_with_run_id(
     Ok(())
 }
 
-fn resume_workflow_run(run_id: &str, auto_yes: bool) -> Result<(), String> {
-    let conn = open_runtime_db()?;
+fn resume_workflow_run(run_id: &str, auto_yes: bool, options: &CliOptions) -> Result<(), String> {
+    let conn = open_runtime_db(options)?;
     let source: String = conn
         .query_row(
             "select source from workflow_runs where id = ?1",
@@ -139,11 +155,11 @@ fn resume_workflow_run(run_id: &str, auto_yes: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to query workflow run '{}': {}", run_id, e))?
         .ok_or_else(|| format!("Workflow run '{}' was not found", run_id))?;
 
-    run_workflow_file_with_run_id(&source, auto_yes, Instant::now(), Some(run_id))
+    run_workflow_file_with_run_id(&source, auto_yes, Instant::now(), Some(run_id), options)
 }
 
-fn show_workflow_runs() -> Result<(), String> {
-    let Some(conn) = open_runtime_db_if_exists()? else {
+fn show_workflow_runs(options: &CliOptions) -> Result<(), String> {
+    let Some(conn) = open_runtime_db_if_exists(options)? else {
         println!("No workflow runs found.");
         return Ok(());
     };
@@ -186,8 +202,8 @@ fn show_workflow_runs() -> Result<(), String> {
     Ok(())
 }
 
-fn show_workflow_run_status(run_id: &str) -> Result<(), String> {
-    let conn = open_runtime_db()?;
+fn show_workflow_run_status(run_id: &str, options: &CliOptions) -> Result<(), String> {
+    let conn = open_runtime_db(options)?;
     let run: Option<(String, String, String, String, String, String)> = conn
         .query_row(
             "select id, name, source, status, created_at, updated_at
@@ -301,8 +317,8 @@ fn show_workflow_run_status(run_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn open_runtime_db_if_exists() -> Result<Option<Connection>, String> {
-    let path = runtime_db_path();
+fn open_runtime_db_if_exists(options: &CliOptions) -> Result<Option<Connection>, String> {
+    let path = runtime_db_path(options)?;
     if !path.is_file() {
         return Ok(None);
     }
@@ -311,17 +327,19 @@ fn open_runtime_db_if_exists() -> Result<Option<Connection>, String> {
         .map_err(|e| format!("Failed to open '{}': {}", path.display(), e))
 }
 
-fn open_runtime_db() -> Result<Connection, String> {
-    open_runtime_db_if_exists()?.ok_or_else(|| {
+fn open_runtime_db(options: &CliOptions) -> Result<Connection, String> {
+    open_runtime_db_if_exists(options)?.ok_or_else(|| {
         format!(
             "Workflow runtime database was not found at '{}'",
-            runtime_db_path().display()
+            runtime_db_path(options)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|error| error)
         )
     })
 }
 
-fn runtime_db_path() -> PathBuf {
-    Executor::new_with_permissions(PermissionSet::new(&Vec::new())).workflow_runtime_db_path()
+fn runtime_db_path(options: &CliOptions) -> Result<PathBuf, String> {
+    Ok(new_executor(PermissionSet::new(&Vec::new()), options)?.workflow_runtime_db_path())
 }
 
 fn yaml_to_value(value: serde_yaml::Value) -> Result<Value, String> {
@@ -447,7 +465,7 @@ fn collect_workflow_zen_commands(value: &Value, commands: &mut Vec<String>) {
     }
 }
 
-fn run_one_off(parts: Vec<String>) -> Result<(), String> {
+fn run_one_off(parts: Vec<String>, options: &CliOptions) -> Result<(), String> {
     if parts.is_empty() {
         return Err("Expected Zen expression to run".into());
     }
@@ -470,10 +488,16 @@ fn run_one_off(parts: Vec<String>) -> Result<(), String> {
     }
 
     let src = format!("{}\n", parts.join(" "));
-    run_source(&src, "<inline>", auto_yes, Instant::now())
+    run_source(&src, "<inline>", auto_yes, Instant::now(), options)
 }
 
-fn run_source(src: &str, audit_label: &str, auto_yes: bool, start: Instant) -> Result<(), String> {
+fn run_source(
+    src: &str,
+    audit_label: &str,
+    auto_yes: bool,
+    start: Instant,
+    options: &CliOptions,
+) -> Result<(), String> {
     let tokens = Lexer::new(src).tokenize()?;
     let mut parser = Parser::new(tokens, src);
     let program = parser.parse_program()?;
@@ -506,7 +530,7 @@ fn run_source(src: &str, audit_label: &str, auto_yes: bool, start: Instant) -> R
 
     let permissions_list = permissions.list();
 
-    let mut executor = Executor::new_with_permissions(permissions);
+    let mut executor = new_executor(permissions, options)?;
 
     let result = executor.execute(program);
 
@@ -530,11 +554,11 @@ fn run_source(src: &str, audit_label: &str, auto_yes: bool, start: Instant) -> R
     result
 }
 
-fn run_repl(auto_yes: bool) -> Result<(), String> {
+fn run_repl(auto_yes: bool, options: &CliOptions) -> Result<(), String> {
     interrupt::install_ctrl_c_handler()?;
     interrupt::clear_interrupt();
 
-    let mut executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
+    let mut executor = new_executor(PermissionSet::new(&Vec::new()), options)?;
     print_repl_banner(&executor);
 
     let mut history = Vec::new();
@@ -1100,7 +1124,8 @@ enum StartupStatus {
 }
 
 fn run_startup_files(executor: &mut Executor, auto_yes: bool) -> Vec<StartupFile> {
-    run_startup_file_paths(executor, auto_yes, repl_startup_paths())
+    let paths = repl_startup_paths(executor.workspace_root_path());
+    run_startup_file_paths(executor, auto_yes, paths)
 }
 
 fn reload_startup_files(
@@ -1154,7 +1179,7 @@ fn run_startup_file_paths(
     files
 }
 
-fn repl_startup_paths() -> Vec<PathBuf> {
+fn repl_startup_paths(workspace_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
     if let Some(base) = dirs::config_dir()
@@ -1165,9 +1190,7 @@ fn repl_startup_paths() -> Vec<PathBuf> {
         paths.push(base.join("zen").join("startup.fg"));
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd.join(".zen").join("startup.fg"));
-    }
+    paths.push(workspace_root.join(".zen").join("startup.fg"));
 
     paths.sort();
     paths.dedup();
@@ -1384,7 +1407,10 @@ fn print_repl_help_topic(topic: &str) -> Result<(), String> {
         }
         "startup" => {
             println!("Startup files:");
-            println!("  Zen checks a user startup file and .zen/startup.fg when the REPL starts.");
+            println!(
+                "  Zen checks a user startup file and <workspace-root>/.zen/startup.fg when the REPL starts."
+            );
+            println!("  Use zen --workspace PATH repl to choose the workspace root explicitly.");
             println!("  Use :startup or :s to show loaded, missing, and failed files.");
             println!("  Use :reload or :r to re-run the same startup files.");
             Ok(())
@@ -2193,6 +2219,16 @@ steps:
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn repl_startup_paths_include_workspace_startup_file() {
+        let root = temp_startup_path().with_file_name("workspace-startup-root");
+        let startup = root.join(".zen").join("startup.fg");
+
+        let paths = repl_startup_paths(&root);
+
+        assert!(paths.contains(&startup));
     }
 
     #[test]
