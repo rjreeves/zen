@@ -1,5 +1,7 @@
+use crate::capabilities::CapabilityGrant;
+use crate::effects::{Effect, Effects, ProcessEffects};
 use crate::events::{Event, EventSink};
-use crate::process::{exec_command, parse_duration, ExecRequest};
+use crate::process::{parse_duration, ExecRequest};
 use crate::values::{
     eq_vals, json_to_value, secret_reference_name, value_to_echo_string, value_to_json, Value,
 };
@@ -567,7 +569,7 @@ impl<'a> WorkflowEngine<'a> {
     ) -> Result<Value, String> {
         self.host.check_permission("proc.exec")?;
         let (resolved_env, secret_values) = self.resolve_workflow_env(env)?;
-        exec_command(ExecRequest {
+        let request = ExecRequest {
             command: command.into(),
             argv: None,
             attempts: 1,
@@ -576,7 +578,8 @@ impl<'a> WorkflowEngine<'a> {
             workdir: Some(self.host.cwd_path().to_string_lossy().into_owned()),
             env: resolved_env,
             secret_values,
-        })
+        };
+        ProcessEffects.perform(Effect::Process(request), &CapabilityGrant::new("proc.exec"))
     }
 
     /// Resolves literal env values as-is and secret references from the

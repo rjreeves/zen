@@ -7,7 +7,9 @@ use crate::runtime::values::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use zen_runtime::process::{exec_command, ExecRequest};
+use zen_runtime::capabilities::CapabilityGrant;
+use zen_runtime::effects::{Effect, Effects, ProcessEffects};
+use zen_runtime::process::ExecRequest;
 
 pub struct PostgresPlugin;
 
@@ -265,7 +267,7 @@ fn run_postgres_command(
     argv.push(program.to_string());
     argv.extend(args.iter().cloned());
 
-    exec_command(ExecRequest {
+    let request = ExecRequest {
         command: format!("{} {}", program, args.join(" ")),
         argv: Some(argv),
         attempts: 1,
@@ -274,7 +276,8 @@ fn run_postgres_command(
         workdir: None,
         env,
         secret_values,
-    })
+    };
+    ProcessEffects.perform(Effect::Process(request), &CapabilityGrant::new("proc.exec"))
 }
 
 fn passwordless_auth_env(mut env: HashMap<String, String>) -> HashMap<String, String> {

@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod effects;
 pub mod events;
 pub mod interrupt;
 pub mod permissions;

@@ -5,6 +5,7 @@ use crate::parser::Parser;
 use crate::permissions::PermissionSet;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use zen_runtime::capabilities::{CapabilityGrant, Capabilities};
+use zen_runtime::effects::{Effect, Effects, ProcessEffects};
 use crate::runtime::plugins::external::{
     discover_external_plugin_manifests, external_plugin_diagnostics,
     load_external_plugin_from_path, record_external_plugin_loaded, record_external_plugin_unloaded,
@@ -1529,7 +1530,7 @@ impl Executor {
     pub(crate) fn process_exec(&mut self, call: FunctionCall) -> Result<Value, String> {
         self.permissions.check("proc.exec")?;
         let request = self.exec_request_from_call(call)?;
-        exec_command(request)
+        ProcessEffects.perform(Effect::Process(request), &CapabilityGrant::new("proc.exec"))
     }
 
     pub(crate) fn external_process_exec(
@@ -1551,7 +1552,7 @@ impl Executor {
 
         let (env, secret_values) =
             crate::runtime::plugins::secrets::resolve_env_config(self, call.config.clone())?;
-        exec_command(ExecRequest {
+        let request = ExecRequest {
             command,
             argv: Some(argv),
             attempts: 1,
@@ -1560,7 +1561,8 @@ impl Executor {
             workdir: Some(self.cwd.to_string_lossy().into_owned()),
             env,
             secret_values,
-        })
+        };
+        ProcessEffects.perform(Effect::Process(request), &CapabilityGrant::new("proc.exec"))
     }
 
     pub(crate) fn process_list_builtin(&mut self) -> Result<Value, String> {
