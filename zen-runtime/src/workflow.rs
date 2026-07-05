@@ -1,3 +1,4 @@
+use crate::events::{Event, EventSink};
 use crate::process::{exec_command, parse_duration, ExecRequest};
 use crate::values::{
     eq_vals, json_to_value, secret_reference_name, value_to_echo_string, value_to_json, Value,
@@ -94,6 +95,26 @@ struct WorkflowPersistence {
     run_id: String,
     resume_checkpoints: HashSet<String>,
     resume_step_outputs: HashMap<String, Value>,
+}
+
+impl EventSink for WorkflowPersistence {
+    fn emit(&mut self, event: &Event) -> Result<(), String> {
+        self.conn
+            .execute(
+                "insert into workflow_events (run_id, event, workflow, step, attempt, created_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    self.run_id,
+                    event.name,
+                    event.workflow,
+                    event.step,
+                    event.attempt.map(|attempt| attempt as i64),
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| format!("Failed to save workflow event: {}", error))?;
+        Ok(())
+    }
 }
 
 /// Runs `workflow.run` workflows against a `WorkflowHost` instead of the
@@ -1528,32 +1549,74 @@ fn push_workflow_event(
     step_name: Option<&str>,
     attempt: Option<usize>,
 ) -> Result<(), String> {
+    let event = Event {
+        name: name.to_string(),
+        workflow: workflow_name.to_string(),
+        step: step_name.map(str::to_string),
+        attempt,
+    };
+
     let mut map = HashMap::new();
-    map.insert("event".into(), Value::String(name.into()));
-    map.insert("workflow".into(), Value::String(workflow_name.into()));
-    if let Some(step_name) = step_name {
-        map.insert("step".into(), Value::String(step_name.into()));
+    map.insert("event".into(), Value::String(event.name.clone()));
+    map.insert("workflow".into(), Value::String(event.workflow.clone()));
+    if let Some(step_name) = &event.step {
+        map.insert("step".into(), Value::String(step_name.clone()));
     }
-    if let Some(attempt) = attempt {
+    if let Some(attempt) = event.attempt {
         map.insert("attempt".into(), Value::Number(attempt as f64));
     }
     events.push(Value::Object(map));
     if let Some(persistence) = persistence {
-        persistence
-            .conn
-            .execute(
-                "insert into workflow_events (run_id, event, workflow, step, attempt, created_at)
-                 values (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    persistence.run_id,
-                    name,
-                    workflow_name,
-                    step_name,
-                    attempt.map(|attempt| attempt as i64),
-                    Utc::now().to_rfc3339()
-                ],
-            )
-            .map_err(|error| format!("Failed to save workflow event: {}", error))?;
+        persistence.emit(&event)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_persistence() -> WorkflowPersistence {
+        let conn = Connection::open_in_memory().unwrap();
+        init_workflow_db(&conn).unwrap();
+        conn.execute(
+            "insert into workflow_runs (id, name, source, status, created_at, updated_at)
+             values ('run-1', 'wf', 'test', 'running', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        WorkflowPersistence {
+            conn,
+            run_id: "run-1".into(),
+            resume_checkpoints: HashSet::new(),
+            resume_step_outputs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn event_sink_persists_emitted_event() {
+        let mut persistence = test_persistence();
+        persistence
+            .emit(&Event {
+                name: "step.succeeded".into(),
+                workflow: "wf".into(),
+                step: Some("build".into()),
+                attempt: Some(2),
+            })
+            .unwrap();
+
+        let (event, step, attempt): (String, Option<String>, Option<i64>) = persistence
+            .conn
+            .query_row(
+                "select event, step, attempt from workflow_events where run_id = 'run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(event, "step.succeeded");
+        assert_eq!(step.as_deref(), Some("build"));
+        assert_eq!(attempt, Some(2));
+    }
 }
