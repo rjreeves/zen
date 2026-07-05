@@ -3,7 +3,7 @@ members = ["zen-runtime"]
 
 [package]
 name = "zen"
-version = "1.0.11"
+version = "1.0.13"
 edition = "2021"
 description = "Zen - Windows-first scripting CLI with typed pipelines and permissions"
 license = "MIT"
