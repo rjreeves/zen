@@ -4,8 +4,10 @@ use crate::lexer::{Lexer, Token};
 use crate::parser::Parser;
 use crate::permissions::PermissionSet;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
-use zen_runtime::capabilities::{CapabilityGrant, Capabilities};
+use zen_runtime::capabilities::{CapabilityDecision, CapabilityGrant, CapabilityRequest, Capabilities};
 use zen_runtime::effects::{Effect, Effects, ProcessEffects};
+use zen_runtime::events::{Event, EventSink};
+use zen_runtime::plugin_host::PluginHost as RuntimePluginHost;
 use crate::runtime::plugins::external::{
     discover_external_plugin_manifests, external_plugin_diagnostics,
     load_external_plugin_from_path, record_external_plugin_loaded, record_external_plugin_unloaded,
@@ -3185,6 +3187,33 @@ impl WorkflowHost for Executor {
     }
 }
 
+/// `.fg` scripts have no persisted event log of their own the way workflows
+/// do (only `WorkflowPersistence` implements `EventSink` for real) - this
+/// exists only so `Executor` can satisfy `zen_runtime::plugin_host::PluginHost`'s
+/// supertrait bound. Same "documented no-op, unreachable from `.fg`/YAML
+/// today" pattern as `Journal::suspend`.
+impl EventSink for Executor {
+    fn emit(&mut self, _event: &Event) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl RuntimePluginHost for Executor {
+    fn use_capability(&mut self, cap: &CapabilityRequest) -> Result<CapabilityGrant, String> {
+        match Capabilities::check(&self.permissions, cap) {
+            CapabilityDecision::Granted => Ok(CapabilityGrant {
+                kind: cap.kind.clone(),
+                resource: cap.resource.clone(),
+            }),
+            CapabilityDecision::Denied(reason) => Err(reason),
+            CapabilityDecision::Prompt => Err(format!(
+                "Capability '{}' requires interactive approval, which isn't supported here",
+                cap.kind
+            )),
+        }
+    }
+}
+
 impl PluginHost for Executor {
     fn check_permission(&self, permission: &str) -> Result<(), String> {
         Executor::check_permission(self, permission)
@@ -3380,6 +3409,30 @@ mod tests {
         let executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
         assert!(executor.permissions.granted().contains("time"));
         assert!(executor.permissions.granted().contains("rand"));
+    }
+
+    #[test]
+    fn use_capability_grants_declared_permission() {
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![(
+            "proc".into(),
+            "exec".into(),
+        )]));
+        let grant = RuntimePluginHost::use_capability(
+            &mut executor,
+            &CapabilityRequest::new("proc.exec"),
+        )
+        .unwrap();
+        assert_eq!(grant.kind, "proc.exec");
+    }
+
+    #[test]
+    fn use_capability_denies_undeclared_permission() {
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
+        let result = RuntimePluginHost::use_capability(
+            &mut executor,
+            &CapabilityRequest::new("proc.exec"),
+        );
+        assert!(result.is_err());
     }
 
     struct TestPlugin;

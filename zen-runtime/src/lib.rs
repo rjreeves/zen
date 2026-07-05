@@ -4,6 +4,7 @@ pub mod events;
 pub mod interrupt;
 pub mod journal;
 pub mod permissions;
+pub mod plugin_host;
 pub mod process;
 pub mod script_runner;
 pub mod secret_store;
