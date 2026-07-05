@@ -17,6 +17,14 @@ pub struct ExecRequest {
     pub wait_children: bool,
     pub workdir: Option<String>,
     pub env: HashMap<String, String>,
+    /// Resolved secret plaintext values (not names) that were used to build
+    /// this request's `env`. Captured stdout/stderr is scanned for these and
+    /// masked before it becomes a `Value` - a tool that echoes its own env
+    /// would otherwise leak a secret straight into output that gets echoed,
+    /// persisted, or displayed. Same tradeoff GitHub Actions/GitLab CI make:
+    /// a transformed copy of the secret (base64'd, split across lines) won't
+    /// match and stays unmasked.
+    pub secret_values: Vec<String>,
 }
 
 struct ExecOutput {
@@ -34,14 +42,14 @@ pub fn exec_command(request: ExecRequest) -> Result<Value, String> {
         let output = run_command_once(&request)?;
 
         if output.status_code == 0 {
-            return Ok(exec_output_to_value(output, attempt));
+            return Ok(exec_output_to_value(output, attempt, &request.secret_values));
         }
 
         last_output = Some((output, attempt));
     }
 
     let (output, attempt) = last_output.ok_or("exec did not run")?;
-    Ok(exec_output_to_value(output, attempt))
+    Ok(exec_output_to_value(output, attempt, &request.secret_values))
 }
 
 fn run_command_once(request: &ExecRequest) -> Result<ExecOutput, String> {
@@ -303,7 +311,7 @@ fn apply_command_options(
     Ok(())
 }
 
-fn exec_output_to_value(output: ExecOutput, attempt: usize) -> Value {
+fn exec_output_to_value(output: ExecOutput, attempt: usize, secret_values: &[String]) -> Value {
     let exitcode = output.status_code;
 
     let mut map = HashMap::new();
@@ -313,10 +321,31 @@ fn exec_output_to_value(output: ExecOutput, attempt: usize) -> Value {
     map.insert("attempts".into(), Value::Number(attempt as f64));
     map.insert("timed_out".into(), Value::Bool(output.timed_out));
     map.insert("cancelled".into(), Value::Bool(output.cancelled));
-    map.insert("stdout".into(), Value::String(output.stdout));
-    map.insert("stderr".into(), Value::String(output.stderr));
+    map.insert(
+        "stdout".into(),
+        Value::String(mask_secrets(&output.stdout, secret_values)),
+    );
+    map.insert(
+        "stderr".into(),
+        Value::String(mask_secrets(&output.stderr, secret_values)),
+    );
 
     Value::Object(map)
+}
+
+/// Replaces every occurrence of each known secret plaintext value with
+/// `***`, mirroring GitHub Actions/GitLab CI log masking. Only exact
+/// substring matches are caught - a transformed copy of the secret (base64'd,
+/// re-encoded, split across lines) will not match and stays unmasked.
+fn mask_secrets(text: &str, secret_values: &[String]) -> String {
+    let mut masked = text.to_string();
+    for secret in secret_values {
+        if secret.is_empty() {
+            continue;
+        }
+        masked = masked.replace(secret.as_str(), "***");
+    }
+    masked
 }
 
 pub fn parse_duration(raw: &str) -> Result<Duration, String> {
@@ -352,6 +381,56 @@ mod tests {
     use std::env;
 
     #[test]
+    fn mask_secrets_replaces_every_occurrence() {
+        let masked = mask_secrets(
+            "password=hunter2 again: hunter2",
+            &["hunter2".to_string()],
+        );
+        assert_eq!(masked, "password=*** again: ***");
+    }
+
+    #[test]
+    fn mask_secrets_ignores_empty_values() {
+        let masked = mask_secrets("unchanged", &[String::new()]);
+        assert_eq!(masked, "unchanged");
+    }
+
+    #[test]
+    fn exec_command_masks_secret_value_in_captured_output() {
+        let command = if cfg!(windows) {
+            "echo %CANARY_SECRET%"
+        } else {
+            "echo $CANARY_SECRET"
+        };
+        let mut env = HashMap::new();
+        env.insert("CANARY_SECRET".into(), "leak-me-please".into());
+
+        let output = exec_command(ExecRequest {
+            command: command.into(),
+            argv: None,
+            attempts: 1,
+            timeout: Some(Duration::from_secs(10)),
+            wait_children: false,
+            workdir: None,
+            env,
+            secret_values: vec!["leak-me-please".into()],
+        })
+        .unwrap();
+
+        let Value::Object(map) = output else {
+            panic!("Expected exec output object");
+        };
+
+        match map.get("stdout") {
+            Some(Value::String(value)) => {
+                assert!(!value.contains("leak-me-please"), "secret leaked: {value:?}");
+                assert!(value.contains("***"), "expected mask marker, got {value:?}");
+            }
+            other => panic!("Expected stdout string, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn argv_exec_resolves_relative_program_against_workdir() {
         let current_exe = env::current_exe().unwrap();
         let workdir = current_exe.parent().unwrap().to_string_lossy().into_owned();
@@ -365,6 +444,7 @@ mod tests {
             wait_children: false,
             workdir: Some(workdir),
             env: HashMap::new(),
+            secret_values: Vec::new(),
         })
         .unwrap();
 
@@ -397,6 +477,7 @@ mod tests {
             wait_children: false,
             workdir: Some(workdir_path.to_string_lossy().into_owned()),
             env: HashMap::new(),
+            secret_values: Vec::new(),
         })
         .unwrap();
 
@@ -447,6 +528,7 @@ mod tests {
             wait_children: false,
             workdir: Some(workdir_path.to_string_lossy().into_owned()),
             env: HashMap::new(),
+            secret_values: Vec::new(),
         })
         .unwrap();
 
@@ -488,6 +570,7 @@ mod tests {
             wait_children: false,
             workdir: Some(workdir_path.to_string_lossy().into_owned()),
             env: HashMap::new(),
+            secret_values: Vec::new(),
         })
         .unwrap();
 

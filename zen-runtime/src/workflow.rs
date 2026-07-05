@@ -1,5 +1,7 @@
 use crate::process::{exec_command, parse_duration, ExecRequest};
-use crate::values::{eq_vals, json_to_value, value_to_echo_string, value_to_json, Value};
+use crate::values::{
+    eq_vals, json_to_value, secret_reference_name, value_to_echo_string, value_to_json, Value,
+};
 use crate::workflow_host::WorkflowHost;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -543,7 +545,7 @@ impl<'a> WorkflowEngine<'a> {
         env: &HashMap<String, WorkflowEnvValue>,
     ) -> Result<Value, String> {
         self.host.check_permission("proc.exec")?;
-        let resolved_env = self.resolve_workflow_env(env)?;
+        let (resolved_env, secret_values) = self.resolve_workflow_env(env)?;
         exec_command(ExecRequest {
             command: command.into(),
             argv: None,
@@ -552,6 +554,7 @@ impl<'a> WorkflowEngine<'a> {
             wait_children: false,
             workdir: Some(self.host.cwd_path().to_string_lossy().into_owned()),
             env: resolved_env,
+            secret_values,
         })
     }
 
@@ -559,25 +562,31 @@ impl<'a> WorkflowEngine<'a> {
     /// trusted secret store. Resolution happens here, right before the
     /// child process is spawned, so the plaintext value never lives on
     /// `WorkflowStep`/`WorkflowSpec` and is never in scope when workflow
-    /// state gets persisted, logged, or echoed as an event.
+    /// state gets persisted, logged, or echoed as an event. Returns the
+    /// resolved secret plaintext values alongside the env map so the caller
+    /// can mask them out of captured process output too.
     fn resolve_workflow_env(
         &self,
         env: &HashMap<String, WorkflowEnvValue>,
-    ) -> Result<HashMap<String, String>, String> {
+    ) -> Result<(HashMap<String, String>, Vec<String>), String> {
         let mut resolved = HashMap::new();
+        let mut secret_values = Vec::new();
         for (key, value) in env {
             let value = match value {
                 WorkflowEnvValue::Literal(value) => value.clone(),
                 WorkflowEnvValue::Secret(name) => {
                     self.host.check_permission("secrets.read")?;
-                    self.host
+                    let secret = self
+                        .host
                         .read_secret(name)?
-                        .ok_or_else(|| format!("Secret '{}' was not found", name))?
+                        .ok_or_else(|| format!("Secret '{}' was not found", name))?;
+                    secret_values.push(secret.clone());
+                    secret
                 }
             };
             resolved.insert(key.clone(), value);
         }
-        Ok(resolved)
+        Ok((resolved, secret_values))
     }
 
     fn workflow_run_zen(&mut self, source: &str) -> Result<Value, String> {
@@ -1249,15 +1258,15 @@ fn workflow_env_from_value(
 fn workflow_env_value_from_value(value: &Value, key: &str) -> Result<WorkflowEnvValue, String> {
     match value {
         Value::String(value) | Value::Secret(value) => Ok(WorkflowEnvValue::Literal(value.clone())),
-        Value::Object(entry) if entry.len() == 1 => match entry.get("secret") {
-            Some(Value::String(name)) if !name.is_empty() => {
-                Ok(WorkflowEnvValue::Secret(name.clone()))
+        Value::Object(entry) if entry.len() == 1 && entry.contains_key("secret") => {
+            match secret_reference_name(value) {
+                Some(name) => Ok(WorkflowEnvValue::Secret(name.to_string())),
+                None => Err(format!(
+                    "workflow env '{}' secret reference must be {{ secret: \"name\" }}",
+                    key
+                )),
             }
-            _ => Err(format!(
-                "workflow env '{}' secret reference must be {{ secret: \"name\" }}",
-                key
-            )),
-        },
+        }
         _ => Err(format!(
             "workflow env '{}' must be a string or {{ secret: \"name\" }}",
             key

@@ -1,11 +1,13 @@
-use crate::ast::FunctionCall;
+use crate::ast::{CallConfig, FunctionCall};
 #[cfg(test)]
 use crate::runtime::executor::Executor;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::{self, Write};
 use std::ptr;
+use zen_runtime::values::{secret_reference_name, value_to_echo_string};
 
 pub struct SecretsPlugin;
 
@@ -44,6 +46,12 @@ static SECRETS_DOCS: &[CommandDoc] = &[
         usage: "secrets.list",
         examples: &["secrets.list", "secrets.list | echo table"],
     },
+    CommandDoc {
+        command: "secrets.save",
+        summary: "Bulk-saves named secrets from an object of name/value pairs.",
+        usage: "secrets.save <{ \"name\": value, ... }>",
+        examples: &["secrets.save { \"pg.password\": $pass, \"pg.user\": $user }"],
+    },
 ];
 
 impl ZenPlugin for SecretsPlugin {
@@ -58,6 +66,7 @@ impl ZenPlugin for SecretsPlugin {
             "secrets.exists",
             "secrets.delete",
             "secrets.list",
+            "secrets.save",
         ]
     }
 
@@ -68,6 +77,7 @@ impl ZenPlugin for SecretsPlugin {
             ("secrets.exists", "secrets.read"),
             ("secrets.delete", "secrets.write"),
             ("secrets.list", "secrets.read"),
+            ("secrets.save", "secrets.write"),
         ]
     }
 
@@ -87,6 +97,7 @@ impl ZenPlugin for SecretsPlugin {
             "secrets.exists" => secrets_exists(executor, call).map(PluginResult::handled),
             "secrets.delete" => secrets_delete(executor, call).map(PluginResult::handled),
             "secrets.list" => secrets_list(executor, call).map(PluginResult::handled),
+            "secrets.save" => secrets_save(executor, call).map(PluginResult::handled),
             _ => Ok(PluginResult::unhandled()),
         }
     }
@@ -172,6 +183,90 @@ fn secrets_list(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Va
             })
             .collect(),
     ))
+}
+
+fn secrets_save(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
+    executor.check_permission("secrets.write")?;
+    // Takes a plain object-literal argument, not a `{ env: {...} }` call
+    // config block - call-config env keys must be bare identifiers (no
+    // dots), but secret names conventionally contain them (e.g.
+    // "dropbox.refresh_token", matching what `secrets.set`/`secrets.get`
+    // already accept as a quoted string name).
+    let [arg] = call.args.as_slice() else {
+        return Err("secrets.save expects one object of { \"name\": value }".into());
+    };
+    let value = executor.plugin_arg_value(arg.clone())?;
+    let Value::Object(map) = value else {
+        return Err("secrets.save expects an object of { \"name\": value }".into());
+    };
+
+    let mut pairs = Vec::new();
+    for (name, value) in map {
+        validate_name(&name)?;
+        let secret = match value {
+            Value::String(value) | Value::Secret(value) => value,
+            other => value_to_echo_string(other),
+        };
+        pairs.push((name, secret));
+    }
+
+    save_secrets(pairs)
+}
+
+/// Writes each `(name, value)` pair to the secret store and returns a
+/// `{ saved, names }` summary. Shared by `secrets.save` and
+/// `dropbox.secrets.save` so provider-specific plugins only need to own their
+/// own env-var aliasing/validation, not the write loop itself.
+pub(crate) fn save_secrets(
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> Result<Value, String> {
+    let mut names = Vec::new();
+    for (name, value) in pairs {
+        write_secret(&name, &value)?;
+        names.push(name);
+    }
+
+    let mut map = HashMap::new();
+    map.insert("saved".into(), Value::Number(names.len() as f64));
+    map.insert(
+        "names".into(),
+        Value::List(names.into_iter().map(Value::String).collect()),
+    );
+    Ok(Value::Object(map))
+}
+
+/// Evaluates an `env: {}` call config into a plain env map, resolving any
+/// `{ secret: "name" }` reference against the secret store (requiring
+/// `secrets.read`) and collecting the resolved plaintext alongside the map so
+/// callers building an `ExecRequest` can mask it out of captured process
+/// output. Shared by the `exec`/external-command builtins and any plugin
+/// (e.g. `postgres.rs`) that spawns a subprocess from a call's env config.
+pub fn resolve_env_config(
+    executor: &mut dyn PluginHost,
+    config: Option<CallConfig>,
+) -> Result<(HashMap<String, String>, Vec<String>), String> {
+    let mut env = HashMap::new();
+    let mut secret_values = Vec::new();
+
+    if let Some(config) = config {
+        for (key, expr) in config.env {
+            let value = executor.plugin_arg_value(expr)?;
+            match secret_reference_name(&value) {
+                Some(name) => {
+                    executor.check_permission("secrets.read")?;
+                    let secret = read_secret(name)?
+                        .ok_or_else(|| format!("Secret '{}' was not found", name))?;
+                    secret_values.push(secret.clone());
+                    env.insert(key, secret);
+                }
+                None => {
+                    env.insert(key, value_to_echo_string(value));
+                }
+            }
+        }
+    }
+
+    Ok((env, secret_values))
 }
 
 fn single_name_arg(
@@ -564,6 +659,119 @@ mod tests {
             Err(err) => assert!(err.contains("secrets.read")),
             Ok(_) => panic!("Expected secrets.get to require secrets.read"),
         }
+    }
+
+    #[test]
+    fn secrets_save_requires_write_permission() {
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
+        let result = SecretsPlugin.call(
+            &mut executor,
+            &FunctionCall {
+                name: vec!["secrets".into(), "save".into()],
+                args: Vec::new(),
+                config: None,
+            },
+            &Value::Null,
+        );
+
+        match result {
+            Err(err) => assert!(err.contains("secrets.write")),
+            Ok(_) => panic!("Expected secrets.save to require secrets.write"),
+        }
+    }
+
+    #[test]
+    fn secrets_save_writes_multiple_secrets_and_reports_names() {
+        let pid = std::process::id();
+        let name_a = format!("zen.test.save_a.{}", pid);
+        let name_b = format!("zen.test.save_b.{}", pid);
+
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![(
+            "secrets".into(),
+            "write".into(),
+        )]));
+        let result = SecretsPlugin
+            .call(
+                &mut executor,
+                &FunctionCall {
+                    name: vec!["secrets".into(), "save".into()],
+                    args: vec![crate::ast::Expr::Object(vec![
+                        (name_a.clone(), crate::ast::Expr::string("value-a")),
+                        (name_b.clone(), crate::ast::Expr::string("value-b")),
+                    ])],
+                    config: None,
+                },
+                &Value::Null,
+            )
+            .unwrap();
+
+        let read_a = read_secret(&name_a).unwrap();
+        let read_b = read_secret(&name_b).unwrap();
+        delete_secret(&name_a).unwrap();
+        delete_secret(&name_b).unwrap();
+
+        assert_eq!(read_a.as_deref(), Some("value-a"));
+        assert_eq!(read_b.as_deref(), Some("value-b"));
+
+        let PluginResult::Handled(Value::Object(map)) = result else {
+            panic!("Expected secrets.save result object");
+        };
+        assert!(matches!(map.get("saved"), Some(Value::Number(n)) if *n == 2.0));
+        let Some(Value::List(names)) = map.get("names") else {
+            panic!("Expected names list");
+        };
+        let names: Vec<&str> = names.iter().filter_map(Value::as_string).collect();
+        assert!(names.contains(&name_a.as_str()));
+        assert!(names.contains(&name_b.as_str()));
+    }
+
+    #[test]
+    fn resolve_env_config_requires_secrets_read_permission() {
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![(
+            "proc".into(),
+            "exec".into(),
+        )]));
+        let config = CallConfig {
+            env: vec![(
+                "SECRET_ENV".into(),
+                crate::ast::Expr::Object(vec![(
+                    "secret".into(),
+                    crate::ast::Expr::string("zen.test.missing"),
+                )]),
+            )],
+        };
+
+        match resolve_env_config(&mut executor, Some(config)) {
+            Err(err) => assert!(err.contains("secrets.read")),
+            Ok(_) => panic!("Expected resolve_env_config to require secrets.read"),
+        }
+    }
+
+    #[test]
+    fn resolve_env_config_resolves_secret_reference_and_collects_it_for_masking() {
+        let name = format!("zen.test.resolve_env.{}", std::process::id());
+        write_secret(&name, "resolved-plaintext").unwrap();
+
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![
+            ("proc".into(), "exec".into()),
+            ("secrets".into(), "read".into()),
+        ]));
+        let config = CallConfig {
+            env: vec![(
+                "SECRET_ENV".into(),
+                crate::ast::Expr::Object(vec![(
+                    "secret".into(),
+                    crate::ast::Expr::string(name.clone()),
+                )]),
+            )],
+        };
+
+        let result = resolve_env_config(&mut executor, Some(config));
+        delete_secret(&name).unwrap();
+        let (env, secret_values) = result.unwrap();
+
+        assert_eq!(env.get("SECRET_ENV").map(String::as_str), Some("resolved-plaintext"));
+        assert_eq!(secret_values, vec!["resolved-plaintext".to_string()]);
     }
 
     #[test]

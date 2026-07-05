@@ -88,3 +88,16 @@ pub fn eq_vals(a: &Value, b: &Value) -> bool {
         _ => false,
     }
 }
+
+/// Recognizes the `{ secret: "name" }` symbolic secret reference shape used
+/// in workflow step env and exec env config, returning the referenced name.
+/// Resolution (looking the name up in a secret store) is left to the caller.
+pub fn secret_reference_name(value: &Value) -> Option<&str> {
+    match value {
+        Value::Object(entry) if entry.len() == 1 => match entry.get("secret") {
+            Some(Value::String(name)) if !name.is_empty() => Some(name.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
