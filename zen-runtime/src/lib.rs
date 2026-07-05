@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod interrupt;
 pub mod permissions;
 pub mod process;

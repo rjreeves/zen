@@ -4,6 +4,7 @@ use crate::lexer::{Lexer, Token};
 use crate::parser::Parser;
 use crate::permissions::PermissionSet;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
+use zen_runtime::capabilities::{CapabilityGrant, Capabilities};
 use crate::runtime::plugins::external::{
     discover_external_plugin_manifests, external_plugin_diagnostics,
     load_external_plugin_from_path, record_external_plugin_loaded, record_external_plugin_unloaded,
@@ -65,7 +66,14 @@ impl Executor {
         Self::new_with_plugins_and_workspace(permissions, builtin_plugins(), workspace_root)
     }
 
-    pub fn new_with_plugins(permissions: PermissionSet, plugins: Vec<Arc<dyn ZenPlugin>>) -> Self {
+    pub fn new_with_plugins(mut permissions: PermissionSet, plugins: Vec<Arc<dyn ZenPlugin>>) -> Self {
+        // `.fg` has always treated time (and any future randomness builtin)
+        // as ambient, ungated authority - auto-grant both here so they now
+        // formally exist as capability kinds (for a future static checker
+        // like Flux to gate on) without changing today's behavior at all.
+        permissions.grant(CapabilityGrant::new("time"));
+        permissions.grant(CapabilityGrant::new("rand"));
+
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let workspace_root = Self::discover_workspace_root(&cwd);
 
@@ -3364,6 +3372,13 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
+
+    #[test]
+    fn fresh_executor_auto_grants_time_and_rand() {
+        let executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
+        assert!(executor.permissions.granted().contains("time"));
+        assert!(executor.permissions.granted().contains("rand"));
+    }
 
     struct TestPlugin;
 

@@ -2393,7 +2393,12 @@ run = "echo hello"
         );
         assert_eq!(
             permissions,
-            vec!["dropbox.read".to_string(), "proc.exec".to_string()]
+            vec![
+                "dropbox.read".to_string(),
+                "proc.exec".to_string(),
+                "rand".to_string(),
+                "time".to_string(),
+            ]
         );
 
         let _ = std::fs::remove_file(path);
