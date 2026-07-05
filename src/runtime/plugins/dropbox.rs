@@ -1,6 +1,6 @@
 use crate::ast::{CallConfig, Expr, FunctionCall};
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::plugins::secrets::{read_secret, write_secret};
 use crate::runtime::values::Value;
 use ring::digest::{digest, SHA256};
@@ -221,7 +221,7 @@ impl ZenPlugin for DropboxPlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         _input: &Value,
     ) -> Result<PluginResult, String> {
@@ -262,7 +262,7 @@ impl ZenPlugin for DropboxPlugin {
     }
 }
 
-fn dropbox_status(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_status(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
     if !call.args.is_empty() {
         return Err("dropbox.status expects no arguments".into());
@@ -307,7 +307,7 @@ fn dropbox_status(executor: &mut Executor, call: &FunctionCall) -> Result<Value,
     Ok(Value::Object(map))
 }
 
-fn dropbox_auth_url(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_auth_url(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     if !call.args.is_empty() {
         return Err("dropbox.auth.url expects no arguments".into());
     }
@@ -326,7 +326,7 @@ fn dropbox_auth_url(executor: &mut Executor, call: &FunctionCall) -> Result<Valu
     Ok(Value::Object(map))
 }
 
-fn dropbox_auth_finish(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_auth_finish(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.write")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -368,7 +368,7 @@ fn dropbox_auth_finish(executor: &mut Executor, call: &FunctionCall) -> Result<V
     Ok(Value::Object(map))
 }
 
-fn dropbox_account(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_account(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
     if !call.args.is_empty() {
         return Err("dropbox.account expects no arguments".into());
@@ -378,7 +378,7 @@ fn dropbox_account(executor: &mut Executor, call: &FunctionCall) -> Result<Value
     account_json(&token).map(Executor::json_to_value)
 }
 
-fn dropbox_list(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_list(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -399,7 +399,7 @@ fn dropbox_list(executor: &mut Executor, call: &FunctionCall) -> Result<Value, S
     Ok(Executor::json_to_value(json))
 }
 
-fn dropbox_metadata(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_metadata(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -489,7 +489,7 @@ fn merge_list_folder_page(
     Ok(())
 }
 
-fn dropbox_download(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_download(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -522,7 +522,7 @@ fn dropbox_download(executor: &mut Executor, call: &FunctionCall) -> Result<Valu
         .map_err(|_| "dropbox.download without local-path expects UTF-8 file content".into())
 }
 
-fn dropbox_download_verify(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_download_verify(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -574,7 +574,7 @@ fn download_verification_result(
     Ok(Value::Object(map))
 }
 
-fn dropbox_sync_down(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_sync_down(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -600,7 +600,7 @@ fn dropbox_sync_down(executor: &mut Executor, call: &FunctionCall) -> Result<Val
     sync_down_entries(&token, remote_folder, &local_root, entries)
 }
 
-fn dropbox_sync_plan_down(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_sync_plan_down(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -626,7 +626,7 @@ fn dropbox_sync_plan_down(executor: &mut Executor, call: &FunctionCall) -> Resul
     plan_down_entries(remote_folder, &local_root, entries)
 }
 
-fn dropbox_sync_up(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_sync_up(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
     executor.check_permission("dropbox.write")?;
 
@@ -670,7 +670,7 @@ fn dropbox_sync_up(executor: &mut Executor, call: &FunctionCall) -> Result<Value
     )
 }
 
-fn dropbox_sync_plan_up(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_sync_plan_up(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -1186,7 +1186,7 @@ fn write_downloaded_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     fs::write(path, bytes).map_err(|e| format!("Failed to write '{}': {}", path.display(), e))
 }
 
-fn dropbox_secrets_import(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_secrets_import(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.read")?;
     executor.check_permission("secrets.write")?;
 
@@ -1221,7 +1221,7 @@ fn dropbox_secrets_import(executor: &mut Executor, call: &FunctionCall) -> Resul
     Ok(Value::Object(map))
 }
 
-fn dropbox_secrets_save(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_secrets_save(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.write")?;
     if !call.args.is_empty() {
         return Err("dropbox.secrets.save expects no arguments".into());
@@ -1295,7 +1295,7 @@ fn parse_secret_bundle(json: &serde_json::Value) -> Result<Vec<(String, String)>
     Ok(secrets)
 }
 
-fn dropbox_upload(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_upload(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.write")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -1311,7 +1311,7 @@ fn dropbox_upload(executor: &mut Executor, call: &FunctionCall) -> Result<Value,
     Ok(Executor::json_to_value(json))
 }
 
-fn dropbox_upload_verify(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_upload_verify(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.write")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -1388,7 +1388,7 @@ fn upload_verification_result(
     Ok(Value::Object(map))
 }
 
-fn dropbox_hash(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_hash(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     let args = arg_strings(executor, call.args.clone())?;
     let local_path = match args.as_slice() {
         [local_path] => local_path,
@@ -1405,7 +1405,7 @@ fn dropbox_hash(executor: &mut Executor, call: &FunctionCall) -> Result<Value, S
     Ok(Value::Object(map))
 }
 
-fn dropbox_verify(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_verify(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     let args = arg_strings(executor, call.args.clone())?;
     let (local_path, expected_hash) = match args.as_slice() {
         [local_path, expected_hash] => (local_path, expected_hash),
@@ -1485,7 +1485,7 @@ impl UploadMode {
     }
 }
 
-fn dropbox_delete(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn dropbox_delete(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("dropbox.write")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -1505,13 +1505,13 @@ fn dropbox_delete(executor: &mut Executor, call: &FunctionCall) -> Result<Value,
     Ok(Executor::json_to_value(json))
 }
 
-fn arg_strings(executor: &mut Executor, args: Vec<Expr>) -> Result<Vec<String>, String> {
+fn arg_strings(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Vec<String>, String> {
     args.into_iter()
         .map(|expr| executor.plugin_arg_value(expr).map(value_to_string))
         .collect()
 }
 
-fn access_token(executor: &mut Executor, config: Option<CallConfig>) -> Result<String, String> {
+fn access_token(executor: &mut dyn PluginHost, config: Option<CallConfig>) -> Result<String, String> {
     let env = call_env(executor, config)?;
     access_token_from_env(env)
 }
@@ -1576,7 +1576,7 @@ fn credential_summary(env: &HashMap<String, String>) -> CredentialSummary {
 }
 
 fn call_env(
-    executor: &mut Executor,
+    executor: &mut dyn PluginHost,
     config: Option<CallConfig>,
 ) -> Result<HashMap<String, String>, String> {
     let mut env = HashMap::new();

@@ -1,6 +1,7 @@
 use crate::ast::{Expr, FunctionCall};
+#[cfg(test)]
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -52,7 +53,7 @@ impl ZenPlugin for ArchivePlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         _input: &Value,
     ) -> Result<PluginResult, String> {
@@ -66,7 +67,7 @@ impl ZenPlugin for ArchivePlugin {
     }
 }
 
-fn archive_zip(executor: &mut Executor, args: Vec<Expr>) -> Result<Value, String> {
+fn archive_zip(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Value, String> {
     executor.check_permission("fs.read")?;
     executor.check_permission("fs.write")?;
 
@@ -149,7 +150,7 @@ fn archive_zip(executor: &mut Executor, args: Vec<Expr>) -> Result<Value, String
     Ok(Value::Object(map))
 }
 
-fn archive_list(executor: &mut Executor, args: Vec<Expr>) -> Result<Value, String> {
+fn archive_list(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Value, String> {
     executor.check_permission("fs.read")?;
 
     if args.len() != 1 {

@@ -1,6 +1,7 @@
 use crate::ast::FunctionCall;
+#[cfg(test)]
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
 use std::ffi::c_void;
 use std::io::{self, Write};
@@ -76,7 +77,7 @@ impl ZenPlugin for SecretsPlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         _input: &Value,
     ) -> Result<PluginResult, String> {
@@ -104,7 +105,7 @@ pub fn write_secret(name: &str, secret: &str) -> Result<(), String> {
     credential_write_target(&target_name(name), secret)
 }
 
-fn secrets_set(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn secrets_set(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.write")?;
     let name = single_name_arg(executor, call, "secrets.set")?;
     print!("Secret value for '{}': ", name);
@@ -120,7 +121,7 @@ fn secrets_set(executor: &mut Executor, call: &FunctionCall) -> Result<Value, St
     Ok(Value::Object(map))
 }
 
-fn secrets_get(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn secrets_get(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.read")?;
     let name = single_name_arg(executor, call, "secrets.get")?;
     match read_secret(&name)? {
@@ -129,13 +130,13 @@ fn secrets_get(executor: &mut Executor, call: &FunctionCall) -> Result<Value, St
     }
 }
 
-fn secrets_exists(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn secrets_exists(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.read")?;
     let name = single_name_arg(executor, call, "secrets.exists")?;
     Ok(Value::Bool(read_secret(&name)?.is_some()))
 }
 
-fn secrets_delete(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn secrets_delete(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.write")?;
     let name = single_name_arg(executor, call, "secrets.delete")?;
     let deleted = credential_delete_target(&target_name(&name))?
@@ -147,7 +148,7 @@ fn secrets_delete(executor: &mut Executor, call: &FunctionCall) -> Result<Value,
     Ok(Value::Object(map))
 }
 
-fn secrets_list(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn secrets_list(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.read")?;
     if !call.args.is_empty() {
         return Err("secrets.list expects no arguments".into());
@@ -166,7 +167,7 @@ fn secrets_list(executor: &mut Executor, call: &FunctionCall) -> Result<Value, S
 }
 
 fn single_name_arg(
-    executor: &mut Executor,
+    executor: &mut dyn PluginHost,
     call: &FunctionCall,
     command: &str,
 ) -> Result<String, String> {

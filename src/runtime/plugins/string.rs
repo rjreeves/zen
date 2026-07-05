@@ -1,6 +1,7 @@
 use crate::ast::{Expr, FunctionCall};
+#[cfg(test)]
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
 
 pub struct StringPlugin;
@@ -116,7 +117,7 @@ impl ZenPlugin for StringPlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         input: &Value,
     ) -> Result<PluginResult, String> {
@@ -207,7 +208,7 @@ impl ZenPlugin for StringPlugin {
 impl StringPlugin {
     fn target_text(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         args: &[Expr],
         input: &Value,
     ) -> Result<String, String> {
@@ -220,7 +221,7 @@ impl StringPlugin {
 
     fn binary_text_args(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         args: &[Expr],
         input: &Value,
         command: &str,
@@ -249,7 +250,7 @@ impl StringPlugin {
 
     fn ternary_text_args(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         args: &[Expr],
         input: &Value,
     ) -> Result<(String, String, String), String> {
@@ -278,7 +279,7 @@ impl StringPlugin {
 
     fn join_args(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         args: &[Expr],
         input: &Value,
     ) -> Result<(Vec<Value>, String), String> {
@@ -300,11 +301,11 @@ impl StringPlugin {
         Ok((self.input_list(input)?, self.text_arg(executor, &args[0])?))
     }
 
-    fn text_arg(&self, executor: &mut Executor, arg: &Expr) -> Result<String, String> {
+    fn text_arg(&self, executor: &mut dyn PluginHost, arg: &Expr) -> Result<String, String> {
         self.value_to_text(executor.plugin_arg_value(arg.clone())?)
     }
 
-    fn list_arg(&self, executor: &mut Executor, arg: &Expr) -> Result<Vec<Value>, String> {
+    fn list_arg(&self, executor: &mut dyn PluginHost, arg: &Expr) -> Result<Vec<Value>, String> {
         self.value_to_list(executor.plugin_arg_value(arg.clone())?)
     }
 

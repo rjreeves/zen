@@ -1,6 +1,7 @@
 use crate::ast::{CallConfig, Expr, FunctionCall};
+#[cfg(test)]
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -94,7 +95,7 @@ impl ZenPlugin for PostgresPlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         input: &Value,
     ) -> Result<PluginResult, String> {
@@ -113,7 +114,7 @@ impl ZenPlugin for PostgresPlugin {
     }
 }
 
-fn pg_version(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn pg_version(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     if !call.args.is_empty() {
         return Err("pg.version expects no arguments".into());
     }
@@ -125,7 +126,7 @@ fn pg_version(executor: &mut Executor, call: &FunctionCall) -> Result<Value, Str
     )
 }
 
-fn pg_query(executor: &mut Executor, call: &FunctionCall, input: &Value) -> Result<Value, String> {
+fn pg_query(executor: &mut dyn PluginHost, call: &FunctionCall, input: &Value) -> Result<Value, String> {
     executor.check_permission("postgres.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -151,7 +152,7 @@ fn pg_query(executor: &mut Executor, call: &FunctionCall, input: &Value) -> Resu
     )
 }
 
-fn pg_auth_passwordless(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn pg_auth_passwordless(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("postgres.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -176,7 +177,7 @@ fn pg_auth_passwordless(executor: &mut Executor, call: &FunctionCall) -> Result<
     Ok(passwordless_auth_result(database, output))
 }
 
-fn pg_dump(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn pg_dump(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("postgres.read")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -193,7 +194,7 @@ fn pg_dump(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String
     )
 }
 
-fn pg_restore(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn pg_restore(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("postgres.write")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -208,7 +209,7 @@ fn pg_restore(executor: &mut Executor, call: &FunctionCall) -> Result<Value, Str
     )
 }
 
-fn pg_pass_path(_executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn pg_pass_path(_executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     if !call.args.is_empty() {
         return Err("pg.pass.path expects no arguments".into());
     }
@@ -216,7 +217,7 @@ fn pg_pass_path(_executor: &mut Executor, call: &FunctionCall) -> Result<Value, 
     Ok(Value::String(pgpass_path()?.display().to_string()))
 }
 
-fn pg_pass_set(executor: &mut Executor, call: &FunctionCall) -> Result<Value, String> {
+fn pg_pass_set(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("postgres.write")?;
 
     let args = arg_strings(executor, call.args.clone())?;
@@ -247,14 +248,14 @@ fn pg_pass_set(executor: &mut Executor, call: &FunctionCall) -> Result<Value, St
     Ok(Value::Object(map))
 }
 
-fn arg_strings(executor: &mut Executor, args: Vec<Expr>) -> Result<Vec<String>, String> {
+fn arg_strings(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Vec<String>, String> {
     args.into_iter()
         .map(|expr| executor.plugin_arg_value(expr).map(value_to_string))
         .collect()
 }
 
 fn command_env(
-    executor: &mut Executor,
+    executor: &mut dyn PluginHost,
     config: Option<CallConfig>,
 ) -> Result<HashMap<String, String>, String> {
     let mut env = HashMap::new();

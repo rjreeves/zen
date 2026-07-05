@@ -1,6 +1,7 @@
 use crate::ast::FunctionCall;
+#[cfg(test)]
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
 
 pub struct TimePlugin;
@@ -156,7 +157,7 @@ impl ZenPlugin for TimePlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         input: &Value,
     ) -> Result<PluginResult, String> {

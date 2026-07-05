@@ -3,7 +3,7 @@ use crate::ast::*;
 use crate::lexer::{Lexer, Token};
 use crate::parser::Parser;
 use crate::permissions::PermissionSet;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::plugins::external::{
     discover_external_plugin_manifests, external_plugin_diagnostics,
     load_external_plugin_from_path, record_external_plugin_loaded, record_external_plugin_unloaded,
@@ -11,6 +11,7 @@ use crate::runtime::plugins::external::{
 };
 use crate::runtime::plugins::registry::builtin_plugins;
 use crate::runtime::process::{exec_command, parse_duration, ExecRequest};
+use crate::runtime::script_runner::ScriptRunner;
 use crate::runtime::time::{duration_summary, parse_time_reference};
 use crate::runtime::values::Value;
 use crate::terminal;
@@ -3548,11 +3549,7 @@ impl Executor {
     }
 
     fn workflow_run_zen(&mut self, source: &str) -> Result<Value, String> {
-        let src = format!("{}\n", source);
-        let tokens = Lexer::new(&src).tokenize()?;
-        let mut parser = Parser::new(tokens, &src);
-        let program = parser.parse_program()?;
-        self.execute_capture(program)
+        self.run_capture(source)
     }
 
     fn workflow_rollback_completed_steps(
@@ -4677,6 +4674,200 @@ impl Executor {
     }
 }
 
+impl ScriptRunner for Executor {
+    fn run_capture(&mut self, source: &str) -> Result<Value, String> {
+        let src = format!("{}\n", source);
+        let tokens = Lexer::new(&src).tokenize()?;
+        let mut parser = Parser::new(tokens, &src);
+        let program = parser.parse_program()?;
+        self.execute_capture(program)
+    }
+}
+
+impl PluginHost for Executor {
+    fn check_permission(&self, permission: &str) -> Result<(), String> {
+        Executor::check_permission(self, permission)
+    }
+
+    fn plugin_arg_value(&mut self, expr: Expr) -> Result<Value, String> {
+        Executor::plugin_arg_value(self, expr)
+    }
+
+    fn resolve_workspace_path(&self, path: &str) -> Result<PathBuf, String> {
+        Executor::resolve_workspace_path(self, path)
+    }
+
+    fn resolve_local_write_path(&self, path: &str) -> Result<PathBuf, String> {
+        Executor::resolve_local_write_path(self, path)
+    }
+
+    fn core_echo(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::core_echo(self, args, input)
+    }
+
+    fn core_parse(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::core_parse(self, args, input)
+    }
+
+    fn core_which(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::core_which(self, args)
+    }
+
+    fn core_clear(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::core_clear(self, args)
+    }
+
+    fn core_cd(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::core_cd(self, args)
+    }
+
+    fn core_pwd(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::core_pwd(self, args)
+    }
+
+    fn core_help(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::core_help(self, args)
+    }
+
+    fn plugins_reload(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::plugins_reload(self, args)
+    }
+
+    fn plugins_discover(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::plugins_discover(self, args)
+    }
+
+    fn plugins_load(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::plugins_load(self, args)
+    }
+
+    fn plugins_unload(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::plugins_unload(self, args)
+    }
+
+    fn process_exec(&mut self, call: FunctionCall) -> Result<Value, String> {
+        Executor::process_exec(self, call)
+    }
+
+    fn external_process_exec(
+        &mut self,
+        base_command: &str,
+        call: &FunctionCall,
+    ) -> Result<Value, String> {
+        Executor::external_process_exec(self, base_command, call)
+    }
+
+    fn workflow_run(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::workflow_run(self, args, input)
+    }
+
+    fn workspace_root(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_root(self, args)
+    }
+
+    fn workspace_cwd(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_cwd(self, args)
+    }
+
+    fn workspace_find(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_find(self, args)
+    }
+
+    fn workspace_exists(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_exists(self, args)
+    }
+
+    fn workspace_read(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_read(self, args)
+    }
+
+    fn workspace_files(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_files(self, args)
+    }
+
+    fn workspace_dirs(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_dirs(self, args)
+    }
+
+    fn workspace_env(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::workspace_env(self, args)
+    }
+
+    fn state_save(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::state_save(self, args)
+    }
+
+    fn state_load(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::state_load(self, args)
+    }
+
+    fn state_clear(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::state_clear(self, args)
+    }
+
+    fn state_list(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::state_list(self, args)
+    }
+
+    fn time_builtin(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::time_builtin(self, args, input)
+    }
+
+    fn time_builtin_with_mode(
+        &mut self,
+        mode: &str,
+        args: Vec<Expr>,
+        input: Value,
+    ) -> Result<Value, String> {
+        Executor::time_builtin_with_mode(self, mode, args, input)
+    }
+
+    fn time_local(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::time_local(self, args, input)
+    }
+
+    fn time_local_with_mode(
+        &mut self,
+        mode: &str,
+        args: Vec<Expr>,
+        input: Value,
+    ) -> Result<Value, String> {
+        Executor::time_local_with_mode(self, mode, args, input)
+    }
+
+    fn time_freeze(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::time_freeze(self, args, input)
+    }
+
+    fn time_measure(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::time_measure(self, args, input)
+    }
+
+    fn time_benchmark(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::time_benchmark(self, args, input)
+    }
+
+    fn time_sleep(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::time_sleep(self, args, input)
+    }
+
+    fn fs_list_builtin(&mut self, args: Vec<Expr>) -> Result<Value, String> {
+        Executor::fs_list_builtin(self, args)
+    }
+
+    fn fs_copy_builtin(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
+        Executor::fs_copy_builtin(self, args, input)
+    }
+
+    fn process_list_builtin(&mut self) -> Result<Value, String> {
+        Executor::process_list_builtin(self)
+    }
+
+    fn plugins_list(&self) -> Result<Value, String> {
+        Executor::plugins_list(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4696,7 +4887,7 @@ mod tests {
 
         fn call(
             &self,
-            _executor: &mut Executor,
+            _executor: &mut dyn PluginHost,
             call: &FunctionCall,
             _input: &Value,
         ) -> Result<PluginResult, String> {

@@ -1,6 +1,7 @@
 use crate::ast::{Expr, FunctionCall};
+#[cfg(test)]
 use crate::runtime::executor::Executor;
-use crate::runtime::plugin::{CommandDoc, PluginResult, ZenPlugin};
+use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::values::Value;
 
 pub struct MathPlugin;
@@ -47,7 +48,7 @@ impl ZenPlugin for MathPlugin {
 
     fn call(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         call: &FunctionCall,
         _input: &Value,
     ) -> Result<PluginResult, String> {
@@ -66,7 +67,7 @@ impl ZenPlugin for MathPlugin {
 impl MathPlugin {
     fn fold_math(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         args: &[Expr],
         initial: f64,
         f: fn(f64, f64) -> f64,
@@ -85,7 +86,7 @@ impl MathPlugin {
 
     fn reduce_math(
         &self,
-        executor: &mut Executor,
+        executor: &mut dyn PluginHost,
         args: &[Expr],
         f: fn(f64, f64) -> f64,
     ) -> Result<f64, String> {
@@ -104,7 +105,7 @@ impl MathPlugin {
         Ok(result)
     }
 
-    fn divide_math(&self, executor: &mut Executor, args: &[Expr]) -> Result<f64, String> {
+    fn divide_math(&self, executor: &mut dyn PluginHost, args: &[Expr]) -> Result<f64, String> {
         if args.len() < 2 {
             return Err("math commands expect at least two numbers".into());
         }
@@ -123,7 +124,7 @@ impl MathPlugin {
         Ok(result)
     }
 
-    fn number_arg(&self, executor: &mut Executor, arg: &Expr) -> Result<f64, String> {
+    fn number_arg(&self, executor: &mut dyn PluginHost, arg: &Expr) -> Result<f64, String> {
         match executor.plugin_arg_value(arg.clone())? {
             Value::Number(value) => Ok(value),
             Value::String(value) => value
