@@ -1,6 +1,7 @@
 use crate::capabilities::CapabilityGrant;
 use crate::effects::{Effect, Effects, ProcessEffects};
 use crate::events::{Event, EventSink};
+use crate::journal::{InstanceId, Journal, ResumeState, Signal, StepId, StepOutcome, StepRecord};
 use crate::process::{parse_duration, ExecRequest};
 use crate::values::{
     eq_vals, json_to_value, secret_reference_name, value_to_echo_string, value_to_json, Value,
@@ -9,7 +10,7 @@ use crate::workflow_host::WorkflowHost;
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -95,8 +96,7 @@ enum WorkflowAction {
 struct WorkflowPersistence {
     conn: Connection,
     run_id: String,
-    resume_checkpoints: HashSet<String>,
-    resume_step_outputs: HashMap<String, Value>,
+    resume_state: ResumeState,
 }
 
 impl EventSink for WorkflowPersistence {
@@ -116,6 +116,81 @@ impl EventSink for WorkflowPersistence {
             )
             .map_err(|error| format!("Failed to save workflow event: {}", error))?;
         Ok(())
+    }
+}
+
+impl Journal for WorkflowPersistence {
+    fn lookup(&self, id: &StepId) -> Option<StepRecord> {
+        self.resume_state.records.get(id).cloned()
+    }
+
+    /// Durability for a checkpointed step's row is handled by
+    /// `persist_workflow_step` (keyed by the step's *name*, which `StepId`
+    /// here doesn't carry - only the checkpoint marker). This just keeps
+    /// the in-memory resume state consistent within the current run, so a
+    /// later `lookup` in the same execution would see it immediately - Zen
+    /// never actually calls `lookup` again after the initial `resume()`
+    /// prefetch, but the contract ("append commits before continuing")
+    /// should hold regardless.
+    fn append(&mut self, id: StepId, outcome: StepOutcome) -> Result<(), String> {
+        self.resume_state.records.insert(id, StepRecord { outcome });
+        Ok(())
+    }
+
+    /// Zen never suspends (no `await`) - this satisfies the trait shape
+    /// Flux needs but is unreachable from today's `.fg`/YAML surface.
+    fn suspend(&mut self, id: StepId, _wakeup: Signal) -> Result<(), String> {
+        self.resume_state
+            .records
+            .insert(id, StepRecord { outcome: StepOutcome::Suspended });
+        Ok(())
+    }
+
+    /// Reproduces the checkpoint/output prefetch `workflow_persistence()`
+    /// has always run at connection-open time - same query, same "succeeded
+    /// and checkpoint is not null" filter - just returned as a `ResumeState`
+    /// instead of populated directly onto two separate fields.
+    fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select checkpoint, output_json from workflow_steps
+                 where run_id = ?1 and status = 'succeeded' and checkpoint is not null",
+            )
+            .map_err(|error| format!("Failed to query workflow checkpoints: {}", error))?;
+        let mut rows = stmt
+            .query(params![instance.0])
+            .map_err(|error| format!("Failed to read workflow checkpoints: {}", error))?;
+
+        let mut records = HashMap::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("Failed to read workflow checkpoint: {}", error))?
+        {
+            let checkpoint = row
+                .get::<_, String>(0)
+                .map_err(|error| format!("Failed to read workflow checkpoint marker: {}", error))?;
+            let output_json = row
+                .get::<_, Option<String>>(1)
+                .map_err(|error| format!("Failed to read workflow checkpoint output: {}", error))?;
+            let output = match output_json {
+                Some(output_json) => {
+                    let json: JsonValue = serde_json::from_str(&output_json).map_err(|error| {
+                        format!("Failed to decode workflow checkpoint output: {}", error)
+                    })?;
+                    workflow_step_output_from_result(&json_to_value(json))
+                }
+                None => Value::Null,
+            };
+            records.insert(
+                StepId::for_checkpoint(&checkpoint),
+                StepRecord {
+                    outcome: StepOutcome::Done(output),
+                },
+            );
+        }
+
+        Ok(ResumeState { records })
     }
 }
 
@@ -205,11 +280,13 @@ impl<'a> WorkflowEngine<'a> {
                 continue;
             }
 
-            if step.checkpoint.as_ref().is_some_and(|checkpoint| {
+            let step_id = step.checkpoint.as_deref().map(StepId::for_checkpoint);
+            let resumed_record = step_id.as_ref().and_then(|step_id| {
                 persistence
                     .as_ref()
-                    .is_some_and(|persistence| persistence.resume_checkpoints.contains(checkpoint))
-            }) {
+                    .and_then(|persistence| persistence.lookup(step_id))
+            });
+            if let Some(record) = resumed_record {
                 push_workflow_event(
                     &mut events,
                     persistence.as_deref_mut(),
@@ -218,11 +295,10 @@ impl<'a> WorkflowEngine<'a> {
                     Some(&step.name),
                     None,
                 )?;
-                let resumed_output = persistence
-                    .as_ref()
-                    .and_then(|persistence| persistence.resume_step_outputs.get(&step.name))
-                    .map(workflow_step_output_from_result)
-                    .unwrap_or(Value::Null);
+                let resumed_output = match record.outcome {
+                    StepOutcome::Done(value) => value,
+                    StepOutcome::Failed(_) | StepOutcome::Suspended => Value::Null,
+                };
                 step_results.push(workflow_step_result(
                     &step.name,
                     "skipped",
@@ -385,6 +461,15 @@ impl<'a> WorkflowEngine<'a> {
             )?;
 
             if status == "succeeded" {
+                // Only succeeded checkpointed steps are ever resumable
+                // (matches `Journal::resume`'s query), so this is the one
+                // place `append` needs to run - a failed step's checkpoint
+                // is never looked up either today or in a future resume.
+                if let (Some(step_id), Some(persistence)) =
+                    (&step_id, persistence.as_deref_mut())
+                {
+                    persistence.append(step_id.clone(), StepOutcome::Done(last_output.clone()))?;
+                }
                 record_workflow_output(&mut outputs, &step, last_output);
                 artifacts.extend(self.workflow_artifact_summaries(&step)?);
                 rollback_stack.push(CompletedWorkflowStep {
@@ -491,47 +576,14 @@ impl<'a> WorkflowEngine<'a> {
         )
         .map_err(|error| format!("Failed to save workflow run: {}", error))?;
 
-        let mut stmt = conn
-            .prepare(
-                "select name, checkpoint, output_json from workflow_steps
-                 where run_id = ?1 and status = 'succeeded' and checkpoint is not null",
-            )
-            .map_err(|error| format!("Failed to query workflow checkpoints: {}", error))?;
-        let mut rows = stmt
-            .query(params![run_id])
-            .map_err(|error| format!("Failed to read workflow checkpoints: {}", error))?;
-        let mut resume_checkpoints = HashSet::new();
-        let mut resume_step_outputs = HashMap::new();
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| format!("Failed to read workflow checkpoint: {}", error))?
-        {
-            let name = row
-                .get::<_, String>(0)
-                .map_err(|error| format!("Failed to read workflow checkpoint name: {}", error))?;
-            let checkpoint = row
-                .get::<_, String>(1)
-                .map_err(|error| format!("Failed to read workflow checkpoint marker: {}", error))?;
-            let output_json = row
-                .get::<_, Option<String>>(2)
-                .map_err(|error| format!("Failed to read workflow checkpoint output: {}", error))?;
-            resume_checkpoints.insert(checkpoint);
-            if let Some(output_json) = output_json {
-                let json: JsonValue = serde_json::from_str(&output_json).map_err(|error| {
-                    format!("Failed to decode workflow checkpoint output: {}", error)
-                })?;
-                resume_step_outputs.insert(name, json_to_value(json));
-            }
-        }
-        drop(rows);
-        drop(stmt);
-
-        Ok(WorkflowPersistence {
+        let mut persistence = WorkflowPersistence {
             conn,
-            run_id,
-            resume_checkpoints,
-            resume_step_outputs,
-        })
+            run_id: run_id.clone(),
+            resume_state: ResumeState::default(),
+        };
+        persistence.resume_state = persistence.resume(InstanceId(run_id))?;
+
+        Ok(persistence)
     }
 
     fn workflow_run_step(&mut self, step: &WorkflowStep) -> Result<WorkflowStepRunResult, String> {
@@ -1592,8 +1644,7 @@ mod tests {
         WorkflowPersistence {
             conn,
             run_id: "run-1".into(),
-            resume_checkpoints: HashSet::new(),
-            resume_step_outputs: HashMap::new(),
+            resume_state: ResumeState::default(),
         }
     }
 
@@ -1621,5 +1672,67 @@ mod tests {
         assert_eq!(event, "step.succeeded");
         assert_eq!(step.as_deref(), Some("build"));
         assert_eq!(attempt, Some(2));
+    }
+
+    #[test]
+    fn journal_append_then_lookup_round_trips_done_outcome() {
+        let mut persistence = test_persistence();
+        let step_id = StepId::for_checkpoint("marker");
+        assert!(persistence.lookup(&step_id).is_none());
+
+        persistence
+            .append(
+                step_id.clone(),
+                StepOutcome::Done(Value::String("result".into())),
+            )
+            .unwrap();
+
+        let record = persistence.lookup(&step_id).unwrap();
+        match record.outcome {
+            StepOutcome::Done(Value::String(value)) => assert_eq!(value, "result"),
+            other => panic!("Expected Done(String), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn journal_resume_only_picks_up_succeeded_checkpointed_steps() {
+        let mut persistence = test_persistence();
+        // Succeeded + checkpointed - the only row that should resume.
+        persistence
+            .conn
+            .execute(
+                "insert into workflow_steps (run_id, name, status, attempts, checkpoint, output_json, error, updated_at)
+                 values ('run-1', 'build', 'succeeded', 1, 'built', null, null, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        // Succeeded but no checkpoint - never resumable, matching today's opt-in rule.
+        persistence
+            .conn
+            .execute(
+                "insert into workflow_steps (run_id, name, status, attempts, checkpoint, output_json, error, updated_at)
+                 values ('run-1', 'no_checkpoint', 'succeeded', 1, null, null, null, '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        // Checkpointed but failed - only succeeded steps are ever resumable.
+        persistence
+            .conn
+            .execute(
+                "insert into workflow_steps (run_id, name, status, attempts, checkpoint, output_json, error, updated_at)
+                 values ('run-1', 'failed_step', 'failed', 1, 'failed-marker', null, 'boom', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let resume_state = persistence.resume(InstanceId("run-1".into())).unwrap();
+
+        assert_eq!(resume_state.records.len(), 1);
+        assert!(resume_state
+            .records
+            .contains_key(&StepId::for_checkpoint("built")));
+        assert!(!resume_state
+            .records
+            .contains_key(&StepId::for_checkpoint("failed-marker")));
     }
 }
