@@ -243,7 +243,7 @@ fn command_builder_shell(
     let mut cmd = if cfg!(windows) {
         let mut cmd = Command::new("cmd");
         cmd.arg("/S").arg("/C");
-        push_windows_raw_arg(&mut cmd, command);
+        push_windows_raw_arg(&mut cmd, &windows_shell_safe_command(command));
         cmd
     } else {
         let mut cmd = Command::new("sh");
@@ -253,6 +253,23 @@ fn command_builder_shell(
 
     apply_command_options(&mut cmd, workdir, env)?;
     Ok(cmd)
+}
+
+/// `cmd /C`'s quote handling only preserves quotes on the command line when
+/// it has exactly two quote characters total (a single bare quoted
+/// executable name, no quoted arguments). Otherwise, if the line starts with
+/// a quote character, cmd strips that leading quote and the *last* quote
+/// anywhere on the line - not its match - which corrupts a quoted path that
+/// itself contains a space once any further quoted argument is present
+/// (e.g. `"C:\Program Files\app.exe" --flag "value with space"`).
+/// Prefixing with `call` keeps the line from starting with a quote at all,
+/// so none of that stripping logic triggers.
+fn windows_shell_safe_command(command: &str) -> String {
+    if command.starts_with('"') {
+        format!("call {}", command)
+    } else {
+        command.to_string()
+    }
 }
 
 #[cfg(windows)]
@@ -404,8 +421,26 @@ mod tests {
         )
         .unwrap();
 
+        // argv[0] stays a bare, extension-less name on purpose: CreateProcess
+        // can't resolve it directly (no PATHEXT-style extension search of its
+        // own), so the argv-direct attempt below is guaranteed to fail and
+        // trigger the shell fallback this test exists to exercise.
+        //
+        // The `command` string below (used only by that fallback) references
+        // the helper by its full path instead of the bare name "msgbox".
+        // cmd.exe's own bare-name resolution also searches its current
+        // directory, but that implicit search is disabled on any machine with
+        // NoDefaultCurrentDirectoryInExePath set - using an explicit path
+        // sidesteps that entirely and can't collide with an unrelated
+        // same-named executable elsewhere on PATH.
+        //
+        // This path starts with a quote character (it contains a space), so
+        // it also exercises windows_shell_safe_command's `call` guard -
+        // without it, cmd's /C quote handling would strip the leading quote
+        // and the last quote anywhere on the line, corrupting the path.
+        let command = format!("\"{}\" \"a b\" \"D \"", helper.display());
         let output = exec_command(ExecRequest {
-            command: "msgbox \"a b\" \"D \"".into(),
+            command,
             argv: Some(vec!["msgbox".into(), "a b".into(), "D ".into()]),
             attempts: 1,
             timeout: Some(Duration::from_secs(10)),
@@ -424,6 +459,47 @@ mod tests {
             Some(Value::String(value)) => assert!(
                 value.contains("first=[a b]") && value.contains("second=[D"),
                 "expected spaced args to stay intact, got {value:?}"
+            ),
+            other => panic!("Expected stdout string, got {:?}", other),
+        }
+
+        let _ = fs::remove_file(helper);
+        let _ = fs::remove_dir(workdir_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_command_preserves_quoted_path_with_quoted_argument() {
+        // Real-world shape this protects: a `run:` step with no structured
+        // argv at all (e.g. `run: "C:\Program Files\app.exe" --flag "value
+        // with space"`), which goes straight to command_builder_shell -
+        // never through the argv-fallback path the test above exercises.
+        let workdir_path = env::temp_dir().join(format!("zen shell quote {}", std::process::id()));
+        fs::create_dir_all(&workdir_path).unwrap();
+        let helper = workdir_path.join("msgbox.cmd");
+        fs::write(&helper, "@echo off\r\necho first=[%~1]\r\n").unwrap();
+
+        let command = format!("\"{}\" \"a b\"", helper.display());
+        let output = exec_command(ExecRequest {
+            command,
+            argv: None,
+            attempts: 1,
+            timeout: Some(Duration::from_secs(10)),
+            wait_children: false,
+            workdir: Some(workdir_path.to_string_lossy().into_owned()),
+            env: HashMap::new(),
+        })
+        .unwrap();
+
+        let Value::Object(map) = output else {
+            panic!("Expected exec output object");
+        };
+
+        assert!(matches!(map.get("success"), Some(Value::Bool(true))));
+        match map.get("stdout") {
+            Some(Value::String(value)) => assert!(
+                value.contains("first=[a b]"),
+                "expected quoted path with a quoted argument to run correctly, got {value:?}"
             ),
             other => panic!("Expected stdout string, got {:?}", other),
         }
