@@ -10,9 +10,9 @@ use crate::runtime::plugins::external::{
     ExternalPluginDiagnostics,
 };
 use crate::runtime::plugins::registry::builtin_plugins;
-use crate::runtime::plugins::secrets::read_secret;
 use crate::runtime::process::{exec_command, parse_duration, ExecRequest};
 use crate::runtime::script_runner::ScriptRunner;
+use crate::runtime::secret_store::SecretStore;
 use crate::runtime::time::{duration_summary, parse_time_reference};
 use crate::runtime::values::Value;
 use crate::terminal;
@@ -3604,7 +3604,7 @@ impl Executor {
                 WorkflowEnvValue::Literal(value) => value.clone(),
                 WorkflowEnvValue::Secret(name) => {
                     self.permissions.check("secrets.read")?;
-                    read_secret(name)?
+                    self.read_secret(name)?
                         .ok_or_else(|| format!("Secret '{}' was not found", name))?
                 }
             };
@@ -4746,6 +4746,12 @@ impl ScriptRunner for Executor {
         let mut parser = Parser::new(tokens, &src);
         let program = parser.parse_program()?;
         self.execute_capture(program)
+    }
+}
+
+impl SecretStore for Executor {
+    fn read_secret(&self, name: &str) -> Result<Option<String>, String> {
+        crate::runtime::plugins::secrets::read_secret(name)
     }
 }
 
