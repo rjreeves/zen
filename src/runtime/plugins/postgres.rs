@@ -1,12 +1,13 @@
-use crate::ast::{CallConfig, Expr, FunctionCall};
+use crate::ast::{Expr, FunctionCall};
 #[cfg(test)]
 use crate::runtime::executor::Executor;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
+use crate::runtime::plugins::secrets::resolve_env_config;
 use crate::runtime::values::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
+use zen_runtime::process::{exec_command, ExecRequest};
 
 pub struct PostgresPlugin;
 
@@ -119,11 +120,8 @@ fn pg_version(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Valu
         return Err("pg.version expects no arguments".into());
     }
 
-    run_postgres_command(
-        "psql",
-        &["--version".into()],
-        command_env(executor, call.config.clone())?,
-    )
+    let (env, secret_values) = resolve_env_config(executor, call.config.clone())?;
+    run_postgres_command("psql", &["--version".into()], env, secret_values)
 }
 
 fn pg_query(executor: &mut dyn PluginHost, call: &FunctionCall, input: &Value) -> Result<Value, String> {
@@ -138,6 +136,7 @@ fn pg_query(executor: &mut dyn PluginHost, call: &FunctionCall, input: &Value) -
         _ => return Err("pg.query expects <database-url-or-name> <sql>".into()),
     };
 
+    let (env, secret_values) = resolve_env_config(executor, call.config.clone())?;
     run_postgres_command(
         "psql",
         &[
@@ -148,7 +147,8 @@ fn pg_query(executor: &mut dyn PluginHost, call: &FunctionCall, input: &Value) -
             "--command".into(),
             sql,
         ],
-        command_env(executor, call.config.clone())?,
+        env,
+        secret_values,
     )
 }
 
@@ -160,6 +160,7 @@ fn pg_auth_passwordless(executor: &mut dyn PluginHost, call: &FunctionCall) -> R
         return Err("pg.auth.passwordless expects <database-url-or-name>".into());
     };
 
+    let (env, secret_values) = resolve_env_config(executor, call.config.clone())?;
     let output = run_postgres_command(
         "psql",
         &[
@@ -171,7 +172,8 @@ fn pg_auth_passwordless(executor: &mut dyn PluginHost, call: &FunctionCall) -> R
             "select 1".into(),
             database.clone(),
         ],
-        passwordless_auth_env(command_env(executor, call.config.clone())?),
+        passwordless_auth_env(env),
+        secret_values,
     )?;
 
     Ok(passwordless_auth_result(database, output))
@@ -187,11 +189,8 @@ fn pg_dump(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, 
         _ => return Err("pg.dump expects <database-url-or-name> [output-path]".into()),
     };
 
-    run_postgres_command(
-        "pg_dump",
-        &command_args,
-        command_env(executor, call.config.clone())?,
-    )
+    let (env, secret_values) = resolve_env_config(executor, call.config.clone())?;
+    run_postgres_command("pg_dump", &command_args, env, secret_values)
 }
 
 fn pg_restore(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
@@ -202,10 +201,12 @@ fn pg_restore(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Valu
         return Err("pg.restore expects <database-url-or-name> <dump-path>".into());
     };
 
+    let (env, secret_values) = resolve_env_config(executor, call.config.clone())?;
     run_postgres_command(
         "pg_restore",
         &["--dbname".into(), database.clone(), dump_path.clone()],
-        command_env(executor, call.config.clone())?,
+        env,
+        secret_values,
     )
 }
 
@@ -254,52 +255,26 @@ fn arg_strings(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Vec<Str
         .collect()
 }
 
-fn command_env(
-    executor: &mut dyn PluginHost,
-    config: Option<CallConfig>,
-) -> Result<HashMap<String, String>, String> {
-    let mut env = HashMap::new();
-
-    if let Some(config) = config {
-        for (key, expr) in config.env {
-            env.insert(key, value_to_string(executor.plugin_arg_value(expr)?));
-        }
-    }
-
-    Ok(env)
-}
-
 fn run_postgres_command(
     program: &str,
     args: &[String],
     env: HashMap<String, String>,
+    secret_values: Vec<String>,
 ) -> Result<Value, String> {
-    let mut command = Command::new(program);
-    command.args(args);
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(program.to_string());
+    argv.extend(args.iter().cloned());
 
-    for (key, value) in env {
-        command.env(key, value);
-    }
-
-    let output = command
-        .output()
-        .map_err(|e| format!("Failed to execute '{}': {}", program, e))?;
-
-    let exitcode = output.status.code().unwrap_or(-1);
-    let mut map = HashMap::new();
-    map.insert("success".into(), Value::Bool(exitcode == 0));
-    map.insert("status".into(), Value::Number(exitcode as f64));
-    map.insert("exitcode".into(), Value::Number(exitcode as f64));
-    map.insert(
-        "stdout".into(),
-        Value::String(String::from_utf8_lossy(&output.stdout).into_owned()),
-    );
-    map.insert(
-        "stderr".into(),
-        Value::String(String::from_utf8_lossy(&output.stderr).into_owned()),
-    );
-
-    Ok(Value::Object(map))
+    exec_command(ExecRequest {
+        command: format!("{} {}", program, args.join(" ")),
+        argv: Some(argv),
+        attempts: 1,
+        timeout: None,
+        wait_children: false,
+        workdir: None,
+        env,
+        secret_values,
+    })
 }
 
 fn passwordless_auth_env(mut env: HashMap<String, String>) -> HashMap<String, String> {

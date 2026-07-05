@@ -1230,23 +1230,7 @@ fn dropbox_secrets_save(executor: &mut dyn PluginHost, call: &FunctionCall) -> R
 
     let env = call_env(executor, call.config.clone())?;
     let secrets = dropbox_secrets_from_env(&env)?;
-
-    for (name, value) in &secrets {
-        write_secret(name, value)?;
-    }
-
-    let mut map = HashMap::new();
-    map.insert("saved".into(), Value::Number(secrets.len() as f64));
-    map.insert(
-        "names".into(),
-        Value::List(
-            secrets
-                .into_iter()
-                .map(|(name, _)| Value::String(name))
-                .collect(),
-        ),
-    );
-    Ok(Value::Object(map))
+    crate::runtime::plugins::secrets::save_secrets(secrets)
 }
 
 struct DownloadedFile {

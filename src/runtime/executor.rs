@@ -1541,6 +1541,8 @@ impl Executor {
             argv.push(text);
         }
 
+        let (env, secret_values) =
+            crate::runtime::plugins::secrets::resolve_env_config(self, call.config.clone())?;
         exec_command(ExecRequest {
             command,
             argv: Some(argv),
@@ -1548,7 +1550,8 @@ impl Executor {
             timeout: None,
             wait_children: false,
             workdir: Some(self.cwd.to_string_lossy().into_owned()),
-            env: self.exec_env_from_config(call.config.clone())?,
+            env,
+            secret_values,
         })
     }
 
@@ -1855,6 +1858,10 @@ impl Executor {
             .collect::<Vec<_>>()
             .join(" ");
 
+        let (env, secret_values) = crate::runtime::plugins::secrets::resolve_env_config(
+            self,
+            call.config,
+        )?;
         Ok(ExecRequest {
             command,
             argv: Some(command_parts),
@@ -1862,7 +1869,8 @@ impl Executor {
             timeout,
             wait_children,
             workdir,
-            env: self.exec_env_from_config(call.config)?,
+            env,
+            secret_values,
         })
     }
 
@@ -2220,22 +2228,6 @@ impl Executor {
         }
 
         None
-    }
-
-    fn exec_env_from_config(
-        &mut self,
-        config: Option<CallConfig>,
-    ) -> Result<HashMap<String, String>, String> {
-        let mut env = HashMap::new();
-
-        if let Some(config) = config {
-            for (key, expr) in config.env {
-                let value = self.eval_echo_arg(expr)?;
-                env.insert(key, value_to_echo_string(value));
-            }
-        }
-
-        Ok(env)
     }
 
     fn echo_target(&mut self, args: Vec<Expr>, input: Value) -> Result<Value, String> {
@@ -6941,6 +6933,7 @@ run = "echo hello"
             wait_children: false,
             workdir: Some("src".into()),
             env: HashMap::new(),
+            secret_values: Vec::new(),
         })
         .unwrap();
 
@@ -7018,6 +7011,7 @@ run = "echo hello"
             wait_children: false,
             workdir: None,
             env: HashMap::new(),
+            secret_values: Vec::new(),
         })
         .unwrap();
         crate::interrupt::clear_interrupt();
