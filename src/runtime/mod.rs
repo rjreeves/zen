@@ -2,9 +2,7 @@ pub mod context;
 pub mod executor;
 pub mod plugin;
 pub mod plugins;
-pub mod process;
 pub mod renderer;
-pub mod script_runner;
-pub mod secret_store;
 pub mod time;
-pub mod values;
+
+pub use zen_runtime::{process, script_runner, secret_store, values};

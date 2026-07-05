@@ -1,5 +1,5 @@
 use crate::interrupt;
-use crate::runtime::values::Value;
+use crate::values::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;

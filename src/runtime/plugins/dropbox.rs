@@ -4,6 +4,7 @@ use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::plugins::secrets::{read_secret, write_secret};
 use crate::runtime::values::Value;
 use ring::digest::{digest, SHA256};
+use zen_runtime::values::json_to_value;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -375,7 +376,7 @@ fn dropbox_account(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result
     }
 
     let token = access_token(executor, call.config.clone())?;
-    account_json(&token).map(Executor::json_to_value)
+    account_json(&token).map(json_to_value)
 }
 
 fn dropbox_list(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
@@ -396,7 +397,7 @@ fn dropbox_list(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Va
     });
     let json = list_folder_all(&token, body)?;
 
-    Ok(Executor::json_to_value(json))
+    Ok(json_to_value(json))
 }
 
 fn dropbox_metadata(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
@@ -410,7 +411,7 @@ fn dropbox_metadata(executor: &mut dyn PluginHost, call: &FunctionCall) -> Resul
     let token = access_token(executor, call.config.clone())?;
     let json = get_metadata(&token, path)?;
 
-    Ok(Executor::json_to_value(json))
+    Ok(json_to_value(json))
 }
 
 fn get_metadata(token: &str, path: &str) -> Result<serde_json::Value, String> {
@@ -512,7 +513,7 @@ fn dropbox_download(executor: &mut dyn PluginHost, call: &FunctionCall) -> Resul
         );
         map.insert("bytes".into(), Value::Number(downloaded.bytes.len() as f64));
         if let Some(metadata) = downloaded.metadata {
-            map.insert("metadata".into(), Executor::json_to_value(metadata));
+            map.insert("metadata".into(), json_to_value(metadata));
         }
         return Ok(Value::Object(map));
     }
@@ -570,7 +571,7 @@ fn download_verification_result(
     map.insert("content_hash".into(), Value::String(local_hash));
     map.insert("remote_content_hash".into(), Value::String(remote_hash));
     map.insert("matches".into(), Value::Bool(matches));
-    map.insert("metadata".into(), Executor::json_to_value(metadata));
+    map.insert("metadata".into(), json_to_value(metadata));
     Ok(Value::Object(map))
 }
 
@@ -1308,7 +1309,7 @@ fn dropbox_upload(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<
         fs::read(local_path).map_err(|e| format!("Failed to read '{}': {}", local_path, e))?;
     let json = upload_file_bytes(&token, remote_path, upload_mode, &bytes)?;
 
-    Ok(Executor::json_to_value(json))
+    Ok(json_to_value(json))
 }
 
 fn dropbox_upload_verify(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
@@ -1384,7 +1385,7 @@ fn upload_verification_result(
     map.insert("content_hash".into(), Value::String(local_hash));
     map.insert("uploaded_content_hash".into(), Value::String(uploaded_hash));
     map.insert("matches".into(), Value::Bool(matches));
-    map.insert("metadata".into(), Executor::json_to_value(metadata));
+    map.insert("metadata".into(), json_to_value(metadata));
     Ok(Value::Object(map))
 }
 
@@ -1502,7 +1503,7 @@ fn dropbox_delete(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<
         .map_err(describe_ureq_error)?;
     let json = response_json(response)?;
 
-    Ok(Executor::json_to_value(json))
+    Ok(json_to_value(json))
 }
 
 fn arg_strings(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Vec<String>, String> {

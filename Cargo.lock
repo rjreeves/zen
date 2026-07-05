@@ -2033,7 +2033,18 @@ dependencies = [
  "sysinfo",
  "thiserror 1.0.69",
  "ureq",
+ "zen-runtime",
  "zip",
+]
+
+[[package]]
+name = "zen-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde_json",
+ "sysinfo",
 ]
 
 [[package]]

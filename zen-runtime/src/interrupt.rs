@@ -1,14 +1,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Once;
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, Once};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static INSTALL: Once = Once::new();
-#[cfg(test)]
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(test)]
+/// Serializes tests that exercise process-level interrupt state (a single
+/// process-wide `AtomicBool`), so they don't race each other. Exposed
+/// unconditionally (not `#[cfg(test)]`) because `cfg(test)` only applies
+/// when this crate itself is the one under test - it would be compiled out
+/// for the `zen` binary's own test runs, which are the actual callers.
 pub fn lock_for_test() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }

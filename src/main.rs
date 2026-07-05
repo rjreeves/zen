@@ -1,12 +1,13 @@
 mod ast; // you'll add this next
 mod audit;
 mod cli;
-mod interrupt;
 mod lexer;
 mod parser; // you'll add this next
-mod permissions;
 mod runtime;
 mod terminal;
+
+use zen_runtime::interrupt;
+use zen_runtime::permissions;
 
 use clap::Parser;
 use std::path::PathBuf;

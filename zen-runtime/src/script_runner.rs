@@ -1,4 +1,4 @@
-use crate::runtime::values::Value;
+use crate::values::Value;
 
 /// Interface for running a `.fg` script and capturing its result.
 ///
