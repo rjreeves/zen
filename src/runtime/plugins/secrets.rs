@@ -105,6 +105,14 @@ pub fn write_secret(name: &str, secret: &str) -> Result<(), String> {
     credential_write_target(&target_name(name), secret)
 }
 
+#[cfg(test)]
+pub(crate) fn delete_secret(name: &str) -> Result<bool, String> {
+    validate_name(name)?;
+    let deleted =
+        credential_delete_target(&target_name(name))? || credential_delete_target(&legacy_target_name(name))?;
+    Ok(deleted)
+}
+
 fn secrets_set(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<Value, String> {
     executor.check_permission("secrets.write")?;
     let name = single_name_arg(executor, call, "secrets.set")?;

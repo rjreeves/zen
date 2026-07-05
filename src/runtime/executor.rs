@@ -10,6 +10,7 @@ use crate::runtime::plugins::external::{
     ExternalPluginDiagnostics,
 };
 use crate::runtime::plugins::registry::builtin_plugins;
+use crate::runtime::plugins::secrets::read_secret;
 use crate::runtime::process::{exec_command, parse_duration, ExecRequest};
 use crate::runtime::script_runner::ScriptRunner;
 use crate::runtime::time::{duration_summary, parse_time_reference};
@@ -52,7 +53,7 @@ struct WorkflowStep {
     command: WorkflowStepCommand,
     condition: Option<WorkflowCondition>,
     timeout: Option<Duration>,
-    env: HashMap<String, String>,
+    env: HashMap<String, WorkflowEnvValue>,
     save_as: Option<String>,
     artifacts: Vec<WorkflowArtifactSpec>,
     retry: RetryPolicy,
@@ -60,6 +61,16 @@ struct WorkflowStep {
     rollback: Vec<WorkflowAction>,
     finally: Vec<WorkflowAction>,
     checkpoint: Option<String>,
+}
+
+/// A workflow step's env value is either a literal string or a symbolic
+/// reference to a secret by name (YAML `{ secret: "name" }`). The secret
+/// variant carries only the name until it's resolved from the trusted
+/// secret store right before spawning the child process — the plaintext
+/// value never gets stored on `WorkflowStep` or persisted anywhere.
+enum WorkflowEnvValue {
+    Literal(String),
+    Secret(String),
 }
 
 #[derive(Clone)]
@@ -2932,7 +2943,13 @@ impl Executor {
             }
             match value {
                 Value::String(_) | Value::Secret(_) => {}
-                _ => errors.push(format!("{}.{} must be a string", path, key)),
+                Value::Object(entry)
+                    if entry.len() == 1
+                        && matches!(entry.get("secret"), Some(Value::String(name)) if !name.is_empty()) => {}
+                _ => errors.push(format!(
+                    "{}.{} must be a string or {{ secret: \"name\" }}",
+                    path, key
+                )),
             }
         }
     }
@@ -3318,7 +3335,9 @@ impl Executor {
         }
     }
 
-    fn workflow_env_from_value(value: Option<&Value>) -> Result<HashMap<String, String>, String> {
+    fn workflow_env_from_value(
+        value: Option<&Value>,
+    ) -> Result<HashMap<String, WorkflowEnvValue>, String> {
         let Some(value) = value else {
             return Ok(HashMap::new());
         };
@@ -3328,9 +3347,30 @@ impl Executor {
 
         let mut env = HashMap::new();
         for (key, value) in map {
-            env.insert(key.clone(), Self::workflow_string_value(value, key)?);
+            env.insert(key.clone(), Self::workflow_env_value_from_value(value, key)?);
         }
         Ok(env)
+    }
+
+    fn workflow_env_value_from_value(value: &Value, key: &str) -> Result<WorkflowEnvValue, String> {
+        match value {
+            Value::String(value) | Value::Secret(value) => {
+                Ok(WorkflowEnvValue::Literal(value.clone()))
+            }
+            Value::Object(entry) if entry.len() == 1 => match entry.get("secret") {
+                Some(Value::String(name)) if !name.is_empty() => {
+                    Ok(WorkflowEnvValue::Secret(name.clone()))
+                }
+                _ => Err(format!(
+                    "workflow env '{}' secret reference must be {{ secret: \"name\" }}",
+                    key
+                )),
+            },
+            _ => Err(format!(
+                "workflow env '{}' must be a string or {{ secret: \"name\" }}",
+                key
+            )),
+        }
     }
 
     fn parse_workflow_condition(raw: &str) -> Result<WorkflowCondition, String> {
@@ -3534,9 +3574,10 @@ impl Executor {
         &mut self,
         command: &str,
         timeout: Option<Duration>,
-        env: &HashMap<String, String>,
+        env: &HashMap<String, WorkflowEnvValue>,
     ) -> Result<Value, String> {
         self.permissions.check("proc.exec")?;
+        let resolved_env = self.resolve_workflow_env(env)?;
         exec_command(ExecRequest {
             command: command.into(),
             argv: None,
@@ -3544,8 +3585,32 @@ impl Executor {
             timeout,
             wait_children: false,
             workdir: Some(self.cwd.to_string_lossy().into_owned()),
-            env: env.clone(),
+            env: resolved_env,
         })
+    }
+
+    /// Resolves literal env values as-is and secret references from the
+    /// trusted secret store. Resolution happens here, right before the
+    /// child process is spawned, so the plaintext value never lives on
+    /// `WorkflowStep`/`WorkflowSpec` and is never in scope when workflow
+    /// state gets persisted, logged, or echoed as an event.
+    fn resolve_workflow_env(
+        &self,
+        env: &HashMap<String, WorkflowEnvValue>,
+    ) -> Result<HashMap<String, String>, String> {
+        let mut resolved = HashMap::new();
+        for (key, value) in env {
+            let value = match value {
+                WorkflowEnvValue::Literal(value) => value.clone(),
+                WorkflowEnvValue::Secret(name) => {
+                    self.permissions.check("secrets.read")?;
+                    read_secret(name)?
+                        .ok_or_else(|| format!("Secret '{}' was not found", name))?
+                }
+            };
+            resolved.insert(key.clone(), value);
+        }
+        Ok(resolved)
     }
 
     fn workflow_run_zen(&mut self, source: &str) -> Result<Value, String> {
@@ -5457,6 +5522,167 @@ mod tests {
                 .map(str::trim),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn workflow_run_resolves_secret_env_from_store() {
+        let _guard = crate::interrupt::lock_for_test();
+        crate::interrupt::clear_interrupt();
+        let secret_name = format!("zen.test.canary.{}", std::process::id());
+        let canary = "ZEN_CANARY_SECRET_plaintext_must_not_persist";
+        crate::runtime::plugins::secrets::write_secret(&secret_name, canary).unwrap();
+
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![
+            ("proc".into(), "exec".into()),
+            ("secrets".into(), "read".into()),
+        ]));
+        // Compares the injected env var against the expected value via exit
+        // code rather than echoing it to stdout, so this test proves
+        // delivery without ever printing the plaintext secret anywhere.
+        let command = workflow_secret_comparison_command(canary);
+        let result = executor.execute(parse(&format!(
+            "let result = workflow.run {{ name: \"secret-smoke\", steps: [{{ name: \"env\", run: \"{}\", env: {{ ZEN_WORKFLOW_SECRET: {{ secret: \"{}\" }} }} }}] }}\n",
+            command, secret_name
+        )));
+
+        crate::runtime::plugins::secrets::delete_secret(&secret_name).unwrap();
+        result.unwrap();
+
+        let Value::Object(result) = executor.ctx.vars.get("result").unwrap() else {
+            panic!("Expected workflow result object");
+        };
+        let Value::List(steps) = result.get("steps").unwrap() else {
+            panic!("Expected workflow steps");
+        };
+        let Value::Object(step) = &steps[0] else {
+            panic!("Expected step object");
+        };
+        let Value::Object(output) = step.get("output").unwrap() else {
+            panic!("Expected step output");
+        };
+        assert!(
+            matches!(output.get("success"), Some(Value::Bool(true))),
+            "child process should have observed the resolved secret value: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn workflow_run_secret_env_requires_secrets_read_permission() {
+        let _guard = crate::interrupt::lock_for_test();
+        crate::interrupt::clear_interrupt();
+        let mut executor = executor_with_exec_permission();
+        let err = executor
+            .execute(parse(
+                "workflow.run { name: \"secret-perm\", steps: [{ name: \"env\", run: \"echo hi\", env: { X: { secret: \"zen.test.perm.missing\" } } }] }\n",
+            ))
+            .unwrap_err();
+        assert!(err.contains("secrets.read"));
+    }
+
+    #[test]
+    fn workflow_run_secret_env_reports_missing_secret() {
+        let _guard = crate::interrupt::lock_for_test();
+        crate::interrupt::clear_interrupt();
+        let missing_name = format!("zen.test.missing.{}", std::process::id());
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![
+            ("proc".into(), "exec".into()),
+            ("secrets".into(), "read".into()),
+        ]));
+        let err = executor
+            .execute(parse(&format!(
+                "workflow.run {{ name: \"missing-secret\", steps: [{{ name: \"env\", run: \"echo hi\", env: {{ X: {{ secret: \"{}\" }} }} }}] }}\n",
+                missing_name
+            )))
+            .unwrap_err();
+        assert!(err.contains("was not found"));
+    }
+
+    #[test]
+    fn workflow_validation_rejects_malformed_secret_env_entries() {
+        let mut executor = executor_with_exec_permission();
+        let err = executor
+            .execute(parse(
+                "workflow.run { name: \"bad-secret-env\", steps: [{ name: \"s\", run: \"echo hi\", env: { A: { secret: 7 }, B: { secret: \"\" }, C: { secret: \"ok\", extra: \"x\" }, D: { notsecret: \"x\" } } }] }\n",
+            ))
+            .expect_err("expected workflow validation error");
+
+        assert!(err.contains("steps[0].env.A must be a string or"));
+        assert!(err.contains("steps[0].env.B must be a string or"));
+        assert!(err.contains("steps[0].env.C must be a string or"));
+        assert!(err.contains("steps[0].env.D must be a string or"));
+    }
+
+    #[test]
+    fn workflow_run_persisted_never_stores_secret_plaintext() {
+        let _guard = crate::interrupt::lock_for_test();
+        crate::interrupt::clear_interrupt();
+        let secret_name = format!("zen.test.persist.{}", std::process::id());
+        let canary = "ZEN_CANARY_SECRET_plaintext_must_not_persist";
+        crate::runtime::plugins::secrets::write_secret(&secret_name, canary).unwrap();
+
+        let mut executor = executor_with_state_workspace(vec![
+            ("proc".into(), "exec".into()),
+            ("secrets".into(), "read".into()),
+        ]);
+        let command = workflow_secret_comparison_command(canary);
+        let workflow = parse(&format!(
+            "workflow.run {{ name: \"persist-secret-smoke\", steps: [{{ name: \"env\", run: \"{}\", env: {{ ZEN_WORKFLOW_SECRET: {{ secret: \"{}\" }} }} }}] }}\n",
+            command, secret_name
+        ));
+        let Stmt::Expr(Expr::Call(call)) = workflow.statements.into_iter().next().unwrap() else {
+            panic!("Expected workflow call");
+        };
+        let value = executor.eval_echo_arg(call.args[0].clone()).unwrap();
+        let result = executor.workflow_run_persisted(value, "workflow.yaml");
+
+        let db_path = executor.workflow_runtime_db_path();
+        let db_bytes = fs::read(&db_path).unwrap();
+        let db_text = String::from_utf8_lossy(&db_bytes);
+
+        crate::runtime::plugins::secrets::delete_secret(&secret_name).unwrap();
+
+        let Value::Object(result) = result.unwrap() else {
+            panic!("Expected workflow result");
+        };
+        assert!(matches!(result.get("success"), Some(Value::Bool(true))));
+        assert!(
+            !db_text.contains(canary),
+            "runtime.db must never contain the plaintext secret"
+        );
+
+        // Positive control: confirm the step actually ran and received the
+        // resolved secret (via exit code, never printed), so the absence
+        // check above isn't vacuous.
+        let Value::List(steps) = result.get("steps").unwrap() else {
+            panic!("Expected workflow steps");
+        };
+        let Value::Object(step) = &steps[0] else {
+            panic!("Expected step object");
+        };
+        let Value::Object(output) = step.get("output").unwrap() else {
+            panic!("Expected step output");
+        };
+        assert!(
+            matches!(output.get("success"), Some(Value::Bool(true))),
+            "child process should have observed the resolved secret value: {:?}",
+            output
+        );
+    }
+
+    /// Builds a shell command that succeeds only if `ZEN_WORKFLOW_SECRET`
+    /// equals `expected`, without ever printing the value — used so
+    /// secret-delivery tests can prove the correct value reached the child
+    /// process while still asserting the value appears nowhere else.
+    fn workflow_secret_comparison_command(expected: &str) -> String {
+        if cfg!(windows) {
+            format!(
+                "if %ZEN_WORKFLOW_SECRET%=={} (exit 0) else (exit 1)",
+                expected
+            )
+        } else {
+            format!("test $ZEN_WORKFLOW_SECRET = {}", expected)
+        }
     }
 
     #[test]

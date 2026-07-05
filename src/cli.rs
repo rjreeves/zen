@@ -379,6 +379,9 @@ fn workflow_permissions(workflow: &Value) -> Result<PermissionSet, String> {
     if workflow_has_run(workflow) {
         required.push(("proc".into(), "exec".into()));
     }
+    if workflow_has_secret_env(workflow) {
+        required.push(("secrets".into(), "read".into()));
+    }
     for command in workflow_zen_commands(workflow) {
         if let Some(permissions) = permission_probe.command_permissions(&command) {
             for permission in permissions {
@@ -428,6 +431,18 @@ fn workflow_permission_from_string(permission: &str) -> Result<(String, String),
         ));
     }
     Ok((parts[0].into(), parts[1].into()))
+}
+
+fn workflow_has_secret_env(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let is_secret_ref =
+                map.len() == 1 && matches!(map.get("secret"), Some(Value::String(_)));
+            is_secret_ref || map.values().any(workflow_has_secret_env)
+        }
+        Value::List(items) => items.iter().any(workflow_has_secret_env),
+        _ => false,
+    }
 }
 
 fn workflow_has_run(value: &Value) -> bool {
@@ -2151,6 +2166,44 @@ steps:
 
         assert!(permissions.contains(&"postgres.read".into()));
         assert!(permissions.contains(&"proc.exec".into()));
+    }
+
+    #[test]
+    fn workflow_permissions_infers_secrets_read_from_secret_env() {
+        let workflow = workflow_from_yaml(
+            r#"
+name: secret-env-smoke
+steps:
+  - name: dump
+    run: pg_dump postgres -f backup.sql
+    env:
+      PGPASSWORD:
+        secret: postgres.password
+"#,
+        );
+
+        let permissions = workflow_permissions(&workflow).unwrap().list();
+
+        assert!(permissions.contains(&"secrets.read".into()));
+        assert!(permissions.contains(&"proc.exec".into()));
+    }
+
+    #[test]
+    fn workflow_permissions_does_not_require_secrets_read_for_literal_env() {
+        let workflow = workflow_from_yaml(
+            r#"
+name: literal-env-smoke
+steps:
+  - name: dump
+    run: pg_dump postgres -f backup.sql
+    env:
+      PGDATABASE: mydb
+"#,
+        );
+
+        let permissions = workflow_permissions(&workflow).unwrap().list();
+
+        assert!(!permissions.contains(&"secrets.read".into()));
     }
 
     #[test]
