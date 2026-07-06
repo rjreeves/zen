@@ -49,10 +49,9 @@ documented: detected passwordless auth wasn't ready, branched via the `if:` cond
 printed the explain step, and skipped the dump step.
 
 **2.1 ("every `.fg` runtime interaction goes through `RuntimeContext` traits") surfaced two
-composition problems worth flagging back to Flux's design, rather than attempting the full
-`executor.rs` sweep:**
+composition problems. Both are now fixed rather than left as findings:**
 
-1. **`RuntimeContext`'s separate-fields shape doesn't construct when one type backs
+1. **`RuntimeContext`'s separate-fields shape didn't construct when one type backs
    multiple bundled traits.** `RUNTIME-INTERFACES.md`'s illustrative `RuntimeContext` holds
    five independent `&mut dyn Trait` fields (`caps`, `effects`, `journal`, `plugins`,
    `events`). For `Executor` - which implements `PluginHost`, `EventSink`, and
@@ -60,27 +59,34 @@ composition problems worth flagging back to Flux's design, rather than attemptin
    `permissions` field - holding `plugins: &mut dyn PluginHost` (a borrow of the whole
    `Executor`) and `caps: &mut dyn Capabilities` (a borrow of `self.permissions`, a field
    of that same `Executor`) at the same time is a real aliasing conflict, not a style
-   choice. Same category of problem `WorkflowHost` already solved via supertraits instead
-   of separate fields.
-2. **Routing an existing concrete-module call through a shared trait isn't always small.**
-   Attempted as a second proof point: `dropbox.rs`'s `secret_value()` and its callers
+   choice. **Fixed** in `zen-runtime/src/runtime_context.rs`: since `PluginHost` (Stage 5)
+   already bundles `use_capability`/`emit`/`secret` behind one handle, `caps`/`events`
+   collapse into `plugins` rather than staying separate fields; `journal`/`effects` stay
+   separate since they're genuinely backed by different objects
+   (`WorkflowPersistence`/stateless `ProcessEffects`) that never alias `plugins`. Proved
+   against the real `Executor` (`runtime_context_constructs_for_real_executor` in
+   `executor.rs`'s test module), not just a stub - `Executor` is the concrete type that
+   made the illustrative shape impossible to build in the first place.
+2. **Routing an existing concrete-module call through a shared trait wasn't small at
+   first look, but was still tractable.** `dropbox.rs`'s `secret_value()` and its callers
    (`access_token_from_env`, `credential_summary`, `app_key_from_env_or_secret`,
-   `app_secret_from_env_or_secret`) are free functions several layers deep with no host
-   parameter at all; routing them through `SecretStore::read_secret` would mean threading
-   a host reference through all of them. Separately, `secrets.rs`'s own plugin functions
-   (`secrets_get`, `secrets_exists`, `resolve_env_config`) already receive a host handle,
-   but it's typed as the *existing*, wide `runtime::plugin::PluginHost` - which has no
-   `read_secret` method and doesn't have `SecretStore` as a supertrait - so even
-   same-crate call sites with a host handle in scope can't reach the shared trait without
-   either widening that existing trait's bounds (avoided in Stage 5 deliberately) or adding
-   a second parameter. Concluded this wasn't worth forcing for no behavior change; noted
-   here instead of implemented.
+   `app_secret_from_env_or_secret`) were free functions several layers deep with no host
+   parameter at all. Separately, `secrets.rs`'s own plugin functions already receive a
+   host handle, but typed as the *existing*, wide `runtime::plugin::PluginHost`, which had
+   no `read_secret` method. **Fixed**: made `SecretStore` a supertrait of the wide
+   `PluginHost` (`src/runtime/plugin.rs`) - free, since `Executor` is `PluginHost`'s only
+   implementor and already implements `SecretStore` separately, same pattern
+   `WorkflowHost` already uses for its own supertraits - which gives every existing
+   `&mut dyn PluginHost` call site `.read_secret(name)` with no upcasting needed. Then
+   threaded an `executor: &dyn PluginHost` parameter through `dropbox.rs`'s five-function
+   chain, replacing the direct `crate::runtime::plugins::secrets::read_secret` call with
+   `executor.read_secret(name)`.
 
-**Deliberately deferred:** the full "every call site in `executor.rs` takes
+**Still deliberately deferred:** the full "every call site in `executor.rs` takes
 `RuntimeContext`" rewrite. Given Zen has exactly one implementation of each trait today,
-an exhaustive sweep wouldn't surface a *new* gap beyond the two above - the real test needs
-a second caller (Flux) to be meaningful, matching the docs' own "design Flux-first,
-validate with Zen" ordering.
+an exhaustive sweep wouldn't surface a *new* gap beyond the two above (now fixed) - the
+real test needs a second caller (Flux) to be meaningful, matching the docs' own "design
+Flux-first, validate with Zen" ordering.
 
 ## Design principles (carried from the Flux docs)
 

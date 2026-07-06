@@ -1,13 +1,21 @@
 use crate::ast::{Expr, FunctionCall};
 use crate::runtime::values::Value;
 use std::path::PathBuf;
+use zen_runtime::secret_store::SecretStore;
 
 /// The surface a `ZenPlugin` is allowed to touch on the runtime host. This
 /// exists so plugins depend on "something that can check permissions, read
 /// the workspace, etc.", not on the concrete `Executor` (which also carries
 /// the .fg interpreter's eval state, session variables, and plugin dispatch).
 /// `Executor` implements this by delegating to its own existing methods.
-pub trait PluginHost {
+///
+/// `SecretStore` as a supertrait (rather than a duplicate `read_secret`
+/// method) costs nothing - `Executor` is the only implementor and already
+/// implements `SecretStore` separately - and gives every existing
+/// `&mut dyn PluginHost` call site `.read_secret(name)` for free, no
+/// upcasting needed (same pattern `WorkflowHost` already uses for
+/// `ScriptRunner`/`SecretStore`).
+pub trait PluginHost: SecretStore {
     fn check_permission(&self, permission: &str) -> Result<(), String>;
     fn plugin_arg_value(&mut self, expr: Expr) -> Result<Value, String>;
     fn resolve_workspace_path(&self, path: &str) -> Result<PathBuf, String>;

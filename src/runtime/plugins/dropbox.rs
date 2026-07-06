@@ -1,7 +1,7 @@
 use crate::ast::{CallConfig, Expr, FunctionCall};
 use crate::runtime::executor::Executor;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
-use crate::runtime::plugins::secrets::{read_secret, write_secret};
+use crate::runtime::plugins::secrets::write_secret;
 use crate::runtime::values::Value;
 use ring::digest::{digest, SHA256};
 use zen_runtime::values::json_to_value;
@@ -270,12 +270,12 @@ fn dropbox_status(executor: &mut dyn PluginHost, call: &FunctionCall) -> Result<
     }
 
     let env = call_env(executor, call.config.clone())?;
-    let summary = credential_summary(&env);
+    let summary = credential_summary(executor, &env);
     let mut map = HashMap::new();
     map.insert("configured".into(), Value::Bool(summary.configured));
     map.insert("source".into(), Value::String(summary.source.into()));
 
-    match access_token_from_env(env) {
+    match access_token_from_env(executor, env) {
         Ok(token) => match account_json(&token) {
             Ok(account) => {
                 map.insert("auth".into(), Value::String("ok".into()));
@@ -314,7 +314,7 @@ fn dropbox_auth_url(executor: &mut dyn PluginHost, call: &FunctionCall) -> Resul
     }
 
     let env = call_env(executor, call.config.clone())?;
-    let app_key = app_key_from_env_or_secret(&env).ok_or_else(|| {
+    let app_key = app_key_from_env_or_secret(executor, &env).ok_or_else(|| {
         "dropbox.auth.url needs DROPBOX_APP_KEY or DROPBOX_CLIENT_ID in env config, process environment, or saved dropbox.app_key"
             .to_string()
     })?;
@@ -337,11 +337,11 @@ fn dropbox_auth_finish(executor: &mut dyn PluginHost, call: &FunctionCall) -> Re
     };
     let env = call_env(executor, call.config.clone())?;
     let configured_app_key = app_key_from_env(&env);
-    let app_key = configured_app_key.clone().or_else(|| secret_value("dropbox.app_key")).ok_or_else(|| {
+    let app_key = configured_app_key.clone().or_else(|| secret_value(executor, "dropbox.app_key")).ok_or_else(|| {
         "dropbox.auth.finish needs DROPBOX_APP_KEY or DROPBOX_CLIENT_ID in env config, process environment, or saved dropbox.app_key"
             .to_string()
     })?;
-    let app_secret = app_secret_from_env_or_secret(&env, configured_app_key.is_none());
+    let app_secret = app_secret_from_env_or_secret(executor, &env, configured_app_key.is_none());
     let token = finish_oauth_code(code, &app_key, app_secret.as_deref())?;
     let secrets = oauth_secrets(&token, &app_key, app_secret.as_deref())?;
 
@@ -1498,18 +1498,21 @@ fn arg_strings(executor: &mut dyn PluginHost, args: Vec<Expr>) -> Result<Vec<Str
 
 fn access_token(executor: &mut dyn PluginHost, config: Option<CallConfig>) -> Result<String, String> {
     let env = call_env(executor, config)?;
-    access_token_from_env(env)
+    access_token_from_env(executor, env)
 }
 
-fn access_token_from_env(env: HashMap<String, String>) -> Result<String, String> {
+fn access_token_from_env(
+    executor: &dyn PluginHost,
+    env: HashMap<String, String>,
+) -> Result<String, String> {
     if let Some(token) = configured_or_process_env(&env, "DROPBOX_TOKEN")
-        .or_else(|| secret_value("dropbox.access_token"))
+        .or_else(|| secret_value(executor, "dropbox.access_token"))
     {
         return Ok(token);
     }
 
     let refresh_token = configured_or_process_env(&env, "DROPBOX_REFRESH_TOKEN")
-        .or_else(|| secret_value("dropbox.refresh_token"))
+        .or_else(|| secret_value(executor, "dropbox.refresh_token"))
         .ok_or_else(|| {
         "Dropbox commands need DROPBOX_TOKEN or DROPBOX_REFRESH_TOKEN in the environment or call config"
             .to_string()
@@ -1517,11 +1520,12 @@ fn access_token_from_env(env: HashMap<String, String>) -> Result<String, String>
     let configured_app_key = app_key_from_env(&env);
     let app_key = configured_app_key
         .clone()
-        .or_else(|| secret_value("dropbox.app_key"))
+        .or_else(|| secret_value(executor, "dropbox.app_key"))
         .ok_or_else(|| {
             "Dropbox refresh-token auth needs DROPBOX_APP_KEY or DROPBOX_CLIENT_ID".to_string()
         })?;
-    let app_secret = app_secret_from_env_or_secret(&env, configured_app_key.is_none());
+    let app_secret =
+        app_secret_from_env_or_secret(executor, &env, configured_app_key.is_none());
 
     refresh_access_token(&refresh_token, &app_key, app_secret.as_deref())
 }
@@ -1531,9 +1535,9 @@ struct CredentialSummary {
     source: &'static str,
 }
 
-fn credential_summary(env: &HashMap<String, String>) -> CredentialSummary {
+fn credential_summary(executor: &dyn PluginHost, env: &HashMap<String, String>) -> CredentialSummary {
     if configured_or_process_env(env, "DROPBOX_TOKEN")
-        .or_else(|| secret_value("dropbox.access_token"))
+        .or_else(|| secret_value(executor, "dropbox.access_token"))
         .is_some()
     {
         return CredentialSummary {
@@ -1543,11 +1547,11 @@ fn credential_summary(env: &HashMap<String, String>) -> CredentialSummary {
     }
 
     let has_refresh = configured_or_process_env(env, "DROPBOX_REFRESH_TOKEN")
-        .or_else(|| secret_value("dropbox.refresh_token"))
+        .or_else(|| secret_value(executor, "dropbox.refresh_token"))
         .is_some();
     let has_app_key = configured_or_process_env(env, "DROPBOX_APP_KEY")
         .or_else(|| configured_or_process_env(env, "DROPBOX_CLIENT_ID"))
-        .or_else(|| secret_value("dropbox.app_key"))
+        .or_else(|| secret_value(executor, "dropbox.app_key"))
         .is_some();
 
     CredentialSummary {
@@ -1587,11 +1591,12 @@ fn app_key_from_env(env: &HashMap<String, String>) -> Option<String> {
         .or_else(|| configured_or_process_env(env, "DROPBOX_CLIENT_ID"))
 }
 
-fn app_key_from_env_or_secret(env: &HashMap<String, String>) -> Option<String> {
-    app_key_from_env(env).or_else(|| secret_value("dropbox.app_key"))
+fn app_key_from_env_or_secret(executor: &dyn PluginHost, env: &HashMap<String, String>) -> Option<String> {
+    app_key_from_env(env).or_else(|| secret_value(executor, "dropbox.app_key"))
 }
 
 fn app_secret_from_env_or_secret(
+    executor: &dyn PluginHost,
     env: &HashMap<String, String>,
     allow_saved_secret: bool,
 ) -> Option<String> {
@@ -1599,7 +1604,7 @@ fn app_secret_from_env_or_secret(
         .or_else(|| configured_or_process_env(env, "DROPBOX_CLIENT_SECRET"))
         .or_else(|| {
             allow_saved_secret
-                .then(|| secret_value("dropbox.app_secret"))
+                .then(|| secret_value(executor, "dropbox.app_secret"))
                 .flatten()
         })
 }
@@ -1681,8 +1686,8 @@ fn oauth_secrets(
     Ok(secrets)
 }
 
-fn secret_value(name: &str) -> Option<String> {
-    read_secret(name).ok().flatten()
+fn secret_value(executor: &dyn PluginHost, name: &str) -> Option<String> {
+    executor.read_secret(name).ok().flatten()
 }
 
 fn url_encode_component(value: &str) -> String {
@@ -2689,28 +2694,31 @@ mod tests {
 
     #[test]
     fn app_secret_from_env_can_ignore_saved_secret_fallback() {
+        let executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
         let env = HashMap::new();
 
-        assert_eq!(app_secret_from_env_or_secret(&env, false), None);
+        assert_eq!(app_secret_from_env_or_secret(&executor, &env, false), None);
     }
 
     #[test]
     fn app_secret_from_env_accepts_explicit_secret_aliases() {
+        let executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
         let mut env = HashMap::new();
         env.insert("DROPBOX_CLIENT_SECRET".into(), "app-secret".into());
 
         assert_eq!(
-            app_secret_from_env_or_secret(&env, false).as_deref(),
+            app_secret_from_env_or_secret(&executor, &env, false).as_deref(),
             Some("app-secret")
         );
     }
 
     #[test]
     fn credential_summary_reports_access_token_source() {
+        let executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
         let mut env = HashMap::new();
         env.insert("DROPBOX_TOKEN".into(), "call-token".into());
 
-        let summary = credential_summary(&env);
+        let summary = credential_summary(&executor, &env);
 
         assert!(summary.configured);
         assert_eq!(summary.source, "access_token");
@@ -2718,11 +2726,12 @@ mod tests {
 
     #[test]
     fn credential_summary_reports_refresh_token_source() {
+        let executor = Executor::new_with_permissions(PermissionSet::new(&Vec::new()));
         let mut env = HashMap::new();
         env.insert("DROPBOX_REFRESH_TOKEN".into(), "refresh".into());
         env.insert("DROPBOX_APP_KEY".into(), "app-key".into());
 
-        let summary = credential_summary(&env);
+        let summary = credential_summary(&executor, &env);
 
         assert!(summary.configured);
         assert_eq!(summary.source, "refresh_token");

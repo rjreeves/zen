@@ -6,6 +6,7 @@ pub mod journal;
 pub mod permissions;
 pub mod plugin_host;
 pub mod process;
+pub mod runtime_context;
 pub mod script_runner;
 pub mod secret_store;
 pub mod values;

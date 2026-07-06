@@ -3435,6 +3435,35 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Proves the corrected `RuntimeContext` shape (collapsing `caps`/
+    /// `events` into `plugins` rather than keeping them separate fields)
+    /// actually constructs for the real `Executor` - the concrete type
+    /// that made the illustrative, five-separate-fields `RuntimeContext`
+    /// impossible to build in the first place (`plugins` needs the whole
+    /// `Executor`; a separate `caps` field pointing at `self.permissions`
+    /// would alias it).
+    #[test]
+    fn runtime_context_constructs_for_real_executor() {
+        let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![(
+            "proc".into(),
+            "exec".into(),
+        )]));
+        let mut effects = ProcessEffects;
+
+        let mut ctx = zen_runtime::runtime_context::RuntimeContext {
+            plugins: &mut executor,
+            effects: &mut effects,
+            journal: None,
+        };
+
+        let grant = ctx
+            .plugins
+            .use_capability(&CapabilityRequest::new("proc.exec"))
+            .unwrap();
+        assert_eq!(grant.kind, "proc.exec");
+        assert!(ctx.journal.is_none());
+    }
+
     struct TestPlugin;
 
     impl ZenPlugin for TestPlugin {
