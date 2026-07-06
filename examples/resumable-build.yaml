@@ -1,0 +1,10 @@
+name: resumable-build
+
+steps:
+  - name: build-release
+    run: cargo build --release
+    checkpoint: release-built
+
+  - name: copy-release
+    run: powershell -NoProfile -Command "Copy-Item target\release\zen.exe dist\zen.exe -Force"
+    checkpoint: release-copied
