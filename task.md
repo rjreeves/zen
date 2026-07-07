@@ -88,6 +88,48 @@ an exhaustive sweep wouldn't surface a *new* gap beyond the two above (now fixed
 real test needs a second caller (Flux) to be meaningful, matching the docs' own "design
 Flux-first, validate with Zen" ordering.
 
+## Phase 3.0 - Fs effect (Flux prerequisite)
+
+Flux's Phase 3.2 (static capability checking + the `Effects` seam, in the separate `Flux` repo)
+needed `Effect` to cover more than process exec. Investigated all three gaps
+(`docs/PHASE3-PLAN.md`'s "3.0 - Prerequisite runtime work" in the Flux repo) before writing any
+code, since the plan doc's framing ("extend `Effect` with `Fs`/`Net`/`Db`, following the existing
+`ProcessEffects` pattern") turned out not to fit all three the same way:
+
+- **Db needed nothing.** `postgres.rs` already imports `zen_runtime::effects::{Effect, Effects,
+  ProcessEffects}` directly - `pg.query`/`pg.dump`/`pg.restore` all shell out via `psql`/`pg_dump`
+  through the existing `Process` effect. No native Postgres client to extract.
+- **Net was skipped**, on purpose, after finding there's no generic `net` capability in Zen at
+  all today - only `dropbox.rs`'s own `ureq` calls, gated by plugin-scoped permissions
+  (`dropbox.read`/`dropbox.write`), never a shared capability reaching `.fg` scripts. Adding
+  `Effect::Net` now would be greenfield design with no existing Zen behavior to validate the seam
+  against, and a real implementor would need `ureq`, which the project's own dependency-footprint
+  guardrail keeps out of `zen-runtime`. Deferred until there's an actual caller (Flux, or a real
+  Zen feature) to design it against.
+- **Fs got a real, narrow seam.** Unlike `Process` (already unified behind one `exec_command`
+  before extraction), filesystem access was scattered across ~6 call sites (`workspace_read`,
+  `fs_copy_builtin`/`fs_copy`/`fs_copy_file`, `fs_list_builtin`/`fs_list`,
+  `workspace_entries`/`workspace_find_files`), each with its own path-resolution/confinement
+  logic (`resolve_workspace_path`, `resolve_local_write_path`, `resolve_fs_path`). Rather than
+  redesigning all of that, added `Effect::Fs(FsRequest::{Read, Write})` carrying an
+  **already-resolved** path - mirroring `ExecRequest`, which is also fully resolved (permissions
+  checked, command built) before `exec_command` ever sees it. Wired into exactly the two call
+  sites whose shape already matched that contract cleanly: `workspace_read` (read) and
+  `pipe_save` (write) - both already resolved a path and checked a capability before touching
+  `std::fs` directly. `fs_copy`/`fs_list`/the `workspace.*` family are explicitly **not** touched;
+  they carry more logic (multi-item copy, directory listing, confinement to a workspace root) that
+  doesn't reduce to "read one file" / "write one file" without a bigger redesign - left as
+  possible follow-on, not something this stage needed to unblock Flux.
+
+Error text preserved exactly: both call sites already built their own error strings (e.g. `Failed
+to read '{}': {}`) from the *original* user-supplied path, not the resolved one. `FsEffects`
+returns only the raw underlying `io::Error` text; both call sites still wrap it in their original
+format string, so `.fg` error messages are byte-for-byte unchanged. Verified with
+`cargo test --workspace < /dev/null`: all 279 `zen` + 19 `zen-runtime` tests pass unchanged,
+including `workspace_read_reads_text_file`, `workspace_read_rejects_parent_traversal`, and
+`save_writes_pipeline_input_to_workspace_file` - the exact tests covering the two touched call
+sites.
+
 ## Design principles (carried from the Flux docs)
 
 - Shape traits for Flux's more demanding needs; validate that Zen's simpler case still

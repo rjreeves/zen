@@ -5,7 +5,7 @@ use crate::parser::Parser;
 use crate::permissions::PermissionSet;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use zen_runtime::capabilities::{CapabilityDecision, CapabilityGrant, CapabilityRequest, Capabilities};
-use zen_runtime::effects::{Effect, Effects, ProcessEffects};
+use zen_runtime::effects::{Effect, Effects, FsEffects, FsRequest, ProcessEffects};
 use zen_runtime::events::{Event, EventSink};
 use zen_runtime::plugin_host::PluginHost as RuntimePluginHost;
 use crate::runtime::plugins::external::{
@@ -787,8 +787,12 @@ impl Executor {
             value => serde_json::to_string_pretty(&value_to_json(&value))
                 .map_err(|error| format!("Failed to encode JSON: {}", error))?,
         };
-        fs::write(&resolved, &text)
-            .map_err(|error| format!("Failed to save '{}': {}", path, error))?;
+        FsEffects
+            .perform(
+                Effect::Fs(FsRequest::Write { path: resolved.clone(), contents: text.clone() }),
+                &CapabilityGrant::new("fs.write"),
+            )
+            .map_err(|reason| format!("Failed to save '{}': {}", path, reason))?;
 
         let mut map = HashMap::new();
         map.insert("saved".into(), Value::Bool(true));
@@ -1388,9 +1392,9 @@ impl Executor {
             return Err(format!("workspace.read expected file '{}'", path));
         }
 
-        fs::read_to_string(&resolved)
-            .map(Value::String)
-            .map_err(|e| format!("Failed to read '{}': {}", path, e))
+        FsEffects
+            .perform(Effect::Fs(FsRequest::Read { path: resolved }), &CapabilityGrant::new("workspace.read"))
+            .map_err(|reason| format!("Failed to read '{}': {}", path, reason))
     }
 
     pub(crate) fn workspace_files(&mut self, args: Vec<Expr>) -> Result<Value, String> {
