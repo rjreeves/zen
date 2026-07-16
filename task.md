@@ -104,3 +104,35 @@ Flux-first, validate with Zen" ordering.
 permission prompt otherwise). Add a unit test for the new trait's implementation directly,
 plus a manual smoke test through the real CLI (`cargo run -- run <script>`) exercising the
 behavior the stage touched.
+
+## Phase 3.0 - prerequisite runtime work for Flux (Flux-driven, from the Flux repo)
+
+Flux's `docs/PHASE3-PLAN.md` sub-phase 3.0 blocks Flux's 3.2 (effects & capabilities): Flux's
+`fetch`/`read`/`write` builtins need `Fs`/`Net` effects that didn't exist in `zen-runtime` -
+`effects::Effect` had only `Process`. Landed the `Fs` half:
+
+- New `zen-runtime/src/fs.rs`: `fs_read`/`fs_write`, a generic whole-file-as-text primitive.
+  Deliberately narrow and new, not a port - Zen's own `fs.list`/`fs.copy`/`workspace.read`/
+  `pipe_save` builtins each carry their own path-resolution (workspace-relative sandboxing)
+  and capability-namespace rules; collapsing them into one generic primitive risked changing
+  behavior neither this task nor Flux's needs require touching. Path resolution and the
+  `fs.read`/`fs.write` permission check stay the caller's job, same division `process.rs`
+  already established for `exec_command`.
+- `effects::Effect` gained an `Fs(FsEffect)` variant (`FsEffect::Read`/`Write`); new
+  `FsEffects` performer alongside the existing `ProcessEffects`, each erroring (not
+  panicking) on the other's effect kind rather than one performer growing an exhaustive
+  match over unrelated effect domains.
+- **Not** wired into any existing Zen builtin or `executor.rs` call site - none of Zen's
+  current fs commands have the plain "read/write this exact path" shape this primitive
+  offers, so there was no existing call site to route through it without redesigning one of
+  those commands, which is out of scope here. Proved against the real filesystem instead (no
+  mocking): `zen-runtime/src/fs.rs` and `effects.rs` both gained tests that write and read
+  real temp files.
+- `Net`/`Db` remain unstarted. `Net` has no existing generic primitive to build from (only
+  Dropbox-specific `ureq` calls in `dropbox.rs`) - a real design task (request/response
+  shape, capability granularity, timeouts/redirects), not a port. `Db` is entangled with
+  Flux's 3.3 (database pushdown) and likely needs shaping alongside that work, not ahead of
+  it.
+
+`cargo build --workspace` and `cargo test --workspace` both green: 279 (zen) + 20 (zen-runtime,
+up from 15) passed, zero regressions.
