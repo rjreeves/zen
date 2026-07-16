@@ -136,3 +136,19 @@ Flux's `docs/PHASE3-PLAN.md` sub-phase 3.0 blocks Flux's 3.2 (effects & capabili
 
 `cargo build --workspace` and `cargo test --workspace` both green: 279 (zen) + 20 (zen-runtime,
 up from 15) passed, zero regressions.
+
+**`Net`, follow-up: data shape only, deliberately no zen-runtime-resident performer.**
+Unlike `Fs`, a real network call needs an HTTP client dependency - and
+`EXTRACTION-PLAN.md`'s own dependency-footprint guardrail table already places `ureq` at
+"language/surface or CLI layer, as appropriate," not `zen-runtime` (it's already there for
+`dropbox.rs`, never in `zen-runtime`). So `Net` splits from the `Fs` pattern on purpose:
+
+- New `zen-runtime/src/net.rs`: `NetRequest` (`method`/`url`/`headers`/`body`/`timeout`) -
+  data only, no HTTP client, no `perform`-style function.
+- `effects::Effect` gained `Net(NetRequest)`; `ProcessEffects`/`FsEffects` both grew a match
+  arm erroring on it (proven by a new test), same cross-rejection pattern as `Fs`. No
+  `NetEffects` performer lives here - whichever crate wants `Net` effects to actually do
+  something implements its own performer with its own HTTP client crate. Flux does this in
+  `flux-lang/src/effects.rs` using `ureq` (same crate `dropbox.rs` already uses, at the same
+  layer the guardrail prescribes).
+- `cargo test --workspace`: 279 (zen) + 21 (zen-runtime), zero regressions.

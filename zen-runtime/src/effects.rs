@@ -1,17 +1,19 @@
 use crate::capabilities::CapabilityGrant;
 use crate::fs::{fs_read, fs_write, FsReadRequest, FsWriteRequest};
+use crate::net::NetRequest;
 use crate::process::{exec_command, ExecRequest};
 use crate::values::Value;
 
 /// The boundary where a language actually does something to the world.
-/// `Process` (subprocess exec, shared by the `exec` builtin, external-command
-/// syntax, the workflow engine, and `postgres.rs`) and `Fs` (whole-file
-/// read/write, see `fs.rs`) are wired through `Effects`. `db`/`net` effects
-/// are a separate, larger follow-on - see `docs/PHASE3-PLAN.md`'s sub-phase
-/// 3.0 in the Flux repo.
+/// `Process` (subprocess exec) and `Fs` (whole-file read/write, see `fs.rs`)
+/// have real performers here (`ProcessEffects`/`FsEffects`), both needing
+/// only `std`. `Net` is a data shape only - `net.rs` explains why no
+/// zen-runtime-resident performer exists for it. `Db` is a separate, larger
+/// follow-on - see `docs/PHASE3-PLAN.md`'s sub-phase 3.0 in the Flux repo.
 pub enum Effect {
     Process(ExecRequest),
     Fs(FsEffect),
+    Net(NetRequest),
 }
 
 /// `Fs`'s two operations, nested inside `Effect::Fs` rather than as two
@@ -45,6 +47,7 @@ impl Effects for ProcessEffects {
         match effect {
             Effect::Process(request) => exec_command(request),
             Effect::Fs(_) => Err("ProcessEffects cannot perform a Fs effect".into()),
+            Effect::Net(_) => Err("ProcessEffects cannot perform a Net effect".into()),
         }
     }
 }
@@ -61,6 +64,7 @@ impl Effects for FsEffects {
             Effect::Fs(FsEffect::Read(request)) => fs_read(request),
             Effect::Fs(FsEffect::Write(request)) => fs_write(request),
             Effect::Process(_) => Err("FsEffects cannot perform a Process effect".into()),
+            Effect::Net(_) => Err("FsEffects cannot perform a Net effect".into()),
         }
     }
 }
@@ -135,5 +139,22 @@ mod tests {
 
         let mismatched = FsEffects.perform(Effect::Process(echo_request("unused")), &grant);
         assert!(mismatched.is_err());
+    }
+
+    #[test]
+    fn neither_existing_performer_handles_a_net_effect() {
+        use crate::net::NetRequest;
+
+        let net_request = || NetRequest {
+            method: "GET".into(),
+            url: "http://unused.invalid".into(),
+            headers: Vec::new(),
+            body: None,
+            timeout: None,
+        };
+        let grant = CapabilityGrant::new("net");
+
+        assert!(ProcessEffects.perform(Effect::Net(net_request()), &grant).is_err());
+        assert!(FsEffects.perform(Effect::Net(net_request()), &grant).is_err());
     }
 }
