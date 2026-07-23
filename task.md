@@ -146,3 +146,27 @@ sites.
 permission prompt otherwise). Add a unit test for the new trait's implementation directly,
 plus a manual smoke test through the real CLI (`cargo run -- run <script>`) exercising the
 behavior the stage touched.
+
+## Phase 3.0 follow-up - List and Net, on top of this section's Fs work
+
+A separate, independent session had picked up the same "extend `Effect`" work in parallel
+(unaware of this one) and landed `Fs(FsRequest::{Read, Write})` plus generalized database
+pushdown in the Flux repo before this history existed here - discovered only when reconciling
+the two afterward. Rather than merge two incompatible `Fs` shapes, **this section's `Fs`
+design (above) was kept as canonical** and the other session's two genuinely independent
+pieces were redone on top of it, fresh:
+
+- **`FsRequest::List { path: PathBuf }`** - lists a directory's immediate entries as
+  `{name, path, is_dir, size}`. A directory's `size` is a **real recursive sum** of every file
+  under it (`directory_size`, private to `effects.rs`), computed here so a caller (Flux) never
+  needs list-iteration/recursion syntax it doesn't have to answer "how big is this folder."
+  Same "narrow primitive, not a port" relationship to Zen's own `fs_list`/`fs_list_builtin`
+  that `Read`/`Write` already have to `workspace_read`/`pipe_save` - not wired into `executor.rs`,
+  Zen's own listing stays untouched.
+- **`net.rs` / `Effect::Net(NetRequest)`** - a data shape only, no HTTP client, no performer
+  here (this section's own reasoning for skipping `Net` entirely still applies: no generic `net`
+  capability in Zen, and a real implementor needs `ureq`, which the dependency-footprint
+  guardrail keeps out of `zen-runtime`). `flux-lang` supplies its own performer with its own
+  `ureq` dependency instead.
+
+`cargo test --workspace`: 279 (zen) + 22 (zen-runtime, up from 19), zero regressions.

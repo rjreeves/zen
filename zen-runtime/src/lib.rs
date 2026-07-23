@@ -3,6 +3,7 @@ pub mod effects;
 pub mod events;
 pub mod interrupt;
 pub mod journal;
+pub mod net;
 pub mod permissions;
 pub mod plugin_host;
 pub mod process;
