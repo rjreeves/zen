@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod durable_journal;
 pub mod effects;
 pub mod events;
 pub mod interrupt;

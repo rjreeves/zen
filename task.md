@@ -170,3 +170,27 @@ pieces were redone on top of it, fresh:
   `ureq` dependency instead.
 
 `cargo test --workspace`: 279 (zen) + 22 (zen-runtime, up from 19), zero regressions.
+
+## Phase 3.4 - a real, durable `Journal` implementor
+
+Flux's Phase 3.4 (durable functions) needed to lower onto `Journal` for real - and reading the
+*only* implementor, `WorkflowPersistence`, before doing that surfaced a real trait-shape gap:
+its `append` is deliberately just an in-memory `HashMap` write (see its own doc comment); real
+SQL durability happens through a separate, Zen-specific function (`persist_workflow_step`) that
+bypasses `Journal` entirely. That's correct for Zen (`resume()` does one real SQL read at the
+start of a run; nothing needs `append` itself to be durable mid-run), but it means the trait's
+own documented contract ("durably append... before continuing") wasn't actually honored by
+anything. Flux's durable functions genuinely need it to be - a step can be journaled between any
+two lines of orchestration code, not just at Zen's fixed per-run resume point.
+
+New `zen-runtime/src/durable_journal.rs`: `SqliteJournal`, additive alongside
+`WorkflowPersistence` - doesn't touch it or any Zen code path. `append`/`suspend` do a real,
+synchronous SQL `INSERT ... ON CONFLICT ... DO UPDATE` before returning (proven by a test that
+appends, drops the connection entirely, reopens fresh, and confirms the row survived - not just
+an in-memory assertion). New table, `durable_steps(instance_id, call_site, loop_key, status,
+result_json, updated_at)`, own file/path (a real integration pointing this at the same
+`.zen/runtime.db` Zen uses is a natural follow-on, not attempted here). Reuses
+`values::{value_to_json, json_to_value}` (already existed) for `StepOutcome::Done(Value)`
+serialization - no new dependency.
+
+`cargo test --workspace`: 279 (zen) + 28 (zen-runtime, up from 22), zero regressions.
