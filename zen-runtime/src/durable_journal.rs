@@ -273,4 +273,62 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Regression test for a real bug: a journaled `Value::Number(f64)`
+    /// round-trips through `value_to_json`/`json_to_value` as a JSON string
+    /// stored in `result_json` (a TEXT column) - `append` writes it,
+    /// `resume` re-parses it via `serde_json::from_str::<serde_json::Value>`.
+    /// That parse goes through serde_json's generic `deserialize_any` path,
+    /// which - without the `float_roundtrip` Cargo feature - uses a fast
+    /// but not-always-correctly-rounded f64 parser: off by 1 ULP for roughly
+    /// 10% of arbitrary floats in `[0, 1)` (measured empirically). A single
+    /// run only samples one random float, so this was easy to miss locally
+    /// and only showed up "occasionally" once enough independent test runs
+    /// (e.g. a parallel `cargo test --workspace`) drove the sample count up.
+    /// Sampling many floats here, in one run, makes that failure rate
+    /// visible directly instead of relying on running the same test many
+    /// times and hoping to get unlucky.
+    #[test]
+    fn a_journaled_float_round_trips_exactly_across_many_real_values() {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+
+        let path = temp_db_path("float-roundtrip-stress");
+        let instance = InstanceId("instance-1".into());
+        let mut journal = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+
+        let mut mismatches = Vec::new();
+        for i in 0..2000u64 {
+            // Same construction Flux's `rand_builtin` uses: hash fresh
+            // per-process OS-seeded entropy into a float in [0, 1).
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u64(i);
+            hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+            let bits = hasher.finish();
+            let original = (bits as f64) / (u64::MAX as f64 + 1.0);
+
+            let id = StepId { call_site: format!("stress#{i}"), loop_key: None };
+            journal.append(id.clone(), StepOutcome::Done(Value::Number(original))).unwrap();
+
+            // Force the real round trip: re-read from SQLite and re-parse
+            // the JSON text, exactly as a second `run_durable` call's
+            // `resume` does on replay - not just a cache hit.
+            let resumed = journal.resume(InstanceId(instance.0.clone())).unwrap();
+            let record = resumed.records.get(&id).unwrap();
+            match record.outcome {
+                StepOutcome::Done(Value::Number(replayed)) if replayed.to_bits() == original.to_bits() => {}
+                StepOutcome::Done(Value::Number(replayed)) => mismatches.push((original, replayed)),
+                ref other => panic!("expected Done(Number(_)), got {other:?}"),
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "{} of 2000 journaled floats did not round-trip exactly, e.g. {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(5)]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

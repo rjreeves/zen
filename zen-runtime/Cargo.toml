@@ -6,7 +6,13 @@ description = "Zen workflow engine runtime: permissions, process exec, and workf
 license = "MIT"
 
 [dependencies]
-serde_json = "1.0"
+# `float_roundtrip`: without it, parsing a JSON number through the generic
+# `serde_json::Value` path (as `durable_journal.rs`'s `outcome_from_row` does
+# for a journaled step result) uses a fast best-effort f64 parser that is not
+# always correctly rounded - off by 1 ULP for ~10% of arbitrary floats in
+# [0,1) in testing. This feature switches that path to an exact parser so a
+# journaled f64 always round-trips bit-for-bit.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["clock"] }
 sysinfo = "0.30"
