@@ -63,5 +63,11 @@ pub trait Journal {
     fn lookup(&self, id: &StepId) -> Option<StepRecord>;
     fn append(&mut self, id: StepId, outcome: StepOutcome) -> Result<(), String>;
     fn suspend(&mut self, id: StepId, wakeup: Signal) -> Result<(), String>;
+    /// Deliver a value to whichever suspended step is waiting on `signal`
+    /// (manual delivery only - no automatic dispatcher/event-bus wakeup
+    /// yet; a caller re-invokes the durable fn after calling this). `None`
+    /// if no suspended step matches; `Some(id)` names the step now marked
+    /// done.
+    fn deliver(&mut self, signal: Signal, value: Value) -> Result<Option<StepId>, String>;
     fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String>;
 }

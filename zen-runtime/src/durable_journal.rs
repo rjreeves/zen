@@ -15,10 +15,10 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::journal::{InstanceId, Journal, ResumeState, Signal, StepId, StepOutcome, StepRecord};
-use crate::values::{json_to_value, value_to_json};
+use crate::values::{json_to_value, value_to_json, Value};
 
 pub struct SqliteJournal {
     conn: Connection,
@@ -110,10 +110,12 @@ impl Journal for SqliteJournal {
     }
 
     fn suspend(&mut self, id: StepId, wakeup: Signal) -> Result<(), String> {
-        // Same durable-write shape as `append`, storing the wakeup signal as
-        // the payload. Unreachable from Flux this slice (`await` is cut -
-        // see docs/PHASE3-PLAN.md's 3.4 scope cuts) but implemented for
-        // real, not stubbed, since it's part of the same trait.
+        // Same durable-write shape as `append`, storing the wakeup signal
+        // (a bare string, not JSON-encoded) as the payload. Read back only
+        // by `deliver`'s own raw SQL query below - `outcome_from_row`'s
+        // "suspended" arm discards this payload when reconstructing an
+        // in-memory `StepRecord`, since `StepOutcome::Suspended` carries no
+        // data of its own.
         self.conn
             .execute(
                 "INSERT INTO durable_steps (instance_id, call_site, loop_key, status, result_json, updated_at)
@@ -125,6 +127,51 @@ impl Journal for SqliteJournal {
             .map_err(|error| format!("Failed to durably suspend step '{}': {error}", id.call_site))?;
         self.cache.insert(id, StepRecord { outcome: StepOutcome::Suspended });
         Ok(())
+    }
+
+    /// Finds whichever suspended step in this instance is waiting on
+    /// `signal` and durably marks it `done` with `value` - manual delivery
+    /// only (no automatic dispatcher/event-bus wakeup; a caller re-invokes
+    /// the durable fn afterward to actually resume it, see
+    /// `docs/DURABLE-EXECUTION.md` in the Flux repo). Deliberately a
+    /// `SELECT` for the exact primary key first, then an `UPDATE` keyed by
+    /// that exact tuple - not a single predicate-based
+    /// `UPDATE ... WHERE status='suspended' AND result_json=?`, since
+    /// SQLite's bundled build has no portable `LIMIT` on `UPDATE` and a
+    /// predicate-only `UPDATE` would silently mark *every* suspended row
+    /// sharing that signal string as done in one call. If more than one
+    /// suspended step happens to share the exact same signal string, this
+    /// matches whichever row the `SELECT` returns first - no fan-out/
+    /// multi-waiter design, a documented scope cut, not solved here.
+    fn deliver(&mut self, signal: Signal, value: Value) -> Result<Option<StepId>, String> {
+        let found: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT call_site, loop_key FROM durable_steps
+                 WHERE instance_id = ?1 AND status = 'suspended' AND result_json = ?2
+                 LIMIT 1",
+                params![self.instance.0, signal.0],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query for a step awaiting signal '{}': {error}", signal.0))?;
+
+        let Some((call_site, loop_key)) = found else {
+            return Ok(None);
+        };
+
+        let payload = value_to_json(&value).to_string();
+        self.conn
+            .execute(
+                "UPDATE durable_steps SET status = 'done', result_json = ?4, updated_at = datetime('now')
+                 WHERE instance_id = ?1 AND call_site = ?2 AND loop_key = ?3",
+                params![self.instance.0, call_site, loop_key, payload],
+            )
+            .map_err(|error| format!("Failed to durably deliver signal '{}': {error}", signal.0))?;
+
+        let id = StepId { call_site, loop_key: loop_key_from_sql(loop_key) };
+        self.cache.insert(id.clone(), StepRecord { outcome: StepOutcome::Done(value) });
+        Ok(Some(id))
     }
 
     fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String> {
@@ -158,7 +205,6 @@ impl Journal for SqliteJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::values::Value;
     use std::env;
 
     fn temp_db_path(name: &str) -> String {
@@ -255,6 +301,106 @@ mod tests {
         let mut reopened = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
         let resumed = reopened.resume(InstanceId(instance.0.clone())).unwrap();
         assert!(matches!(resumed.records.get(&id).unwrap().outcome, StepOutcome::Suspended));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_finds_a_suspended_step_and_marks_it_done() {
+        let path = temp_db_path("deliver-basic");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let id = StepId { call_site: "approval#2".into(), loop_key: None };
+
+        journal.suspend(id.clone(), Signal("ship-approved".into())).unwrap();
+        let delivered = journal.deliver(Signal("ship-approved".into()), Value::Bool(true)).unwrap();
+
+        assert_eq!(delivered, Some(id.clone()));
+        let record = journal.lookup(&id).unwrap();
+        assert!(matches!(record.outcome, StepOutcome::Done(Value::Bool(true))));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_with_no_matching_signal_returns_none() {
+        let path = temp_db_path("deliver-no-match");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+
+        let delivered = journal.deliver(Signal("nothing-waiting".into()), Value::Bool(true)).unwrap();
+        assert!(delivered.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_then_resume_round_trips_the_delivered_value() {
+        // Same "drop the connection, reopen fresh" proof as
+        // `append_is_really_durable_across_a_fresh_connection` - the
+        // delivered value must be readable by a completely separate
+        // process/connection, not just the one that delivered it.
+        let path = temp_db_path("deliver-durable-across-reopen");
+        let instance = InstanceId("instance-1".into());
+        let id = StepId { call_site: "approval#2".into(), loop_key: None };
+
+        {
+            let mut journal = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+            journal.suspend(id.clone(), Signal("ship-approved".into())).unwrap();
+            journal.deliver(Signal("ship-approved".into()), Value::Number(42.0)).unwrap();
+            // journal (and its Connection) dropped here.
+        }
+
+        let mut reopened = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+        let resumed = reopened.resume(InstanceId(instance.0.clone())).unwrap();
+        let record = resumed.records.get(&id).expect("expected the delivered row to have survived reopening");
+        assert!(matches!(record.outcome, StepOutcome::Done(Value::Number(n)) if n == 42.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_only_affects_the_matching_instance() {
+        let path = temp_db_path("deliver-instance-isolation");
+        let id = StepId { call_site: "approval#2".into(), loop_key: None };
+
+        let mut journal_a = SqliteJournal::open(&path, InstanceId("instance-a".into())).unwrap();
+        journal_a.suspend(id.clone(), Signal("ship-approved".into())).unwrap();
+
+        let mut journal_b = SqliteJournal::open(&path, InstanceId("instance-b".into())).unwrap();
+        journal_b.suspend(id.clone(), Signal("ship-approved".into())).unwrap();
+
+        let delivered = journal_a.deliver(Signal("ship-approved".into()), Value::Bool(true)).unwrap();
+        assert_eq!(delivered, Some(id.clone()));
+
+        // instance-b's own suspended row must be untouched.
+        let resumed_b = journal_b.resume(InstanceId("instance-b".into())).unwrap();
+        assert!(matches!(resumed_b.records.get(&id).unwrap().outcome, StepOutcome::Suspended));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_updates_the_exact_row_not_every_row_sharing_the_signal() {
+        // Two different steps in the same instance suspended on the exact
+        // same signal string - delivering once must only mark one of them
+        // done, proving the implementation keys its UPDATE by the exact
+        // primary key found via SELECT, not a predicate-only
+        // `WHERE status='suspended' AND result_json=?` that could match
+        // (and update) every row sharing that string.
+        let path = temp_db_path("deliver-exact-row");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let id_1 = StepId { call_site: "approval#2".into(), loop_key: None };
+        let id_2 = StepId { call_site: "approval#5".into(), loop_key: None };
+
+        journal.suspend(id_1.clone(), Signal("ship-approved".into())).unwrap();
+        journal.suspend(id_2.clone(), Signal("ship-approved".into())).unwrap();
+
+        journal.deliver(Signal("ship-approved".into()), Value::Bool(true)).unwrap();
+
+        let done_count = [&id_1, &id_2]
+            .iter()
+            .filter(|id| matches!(journal.lookup(id).unwrap().outcome, StepOutcome::Done(_)))
+            .count();
+        assert_eq!(done_count, 1, "expected exactly one of the two suspended rows to become Done");
 
         let _ = std::fs::remove_file(&path);
     }
