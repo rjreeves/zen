@@ -1,7 +1,7 @@
 use crate::capabilities::CapabilityGrant;
 use crate::effects::{Effect, Effects, ProcessEffects};
 use crate::events::{Event, EventSink};
-use crate::journal::{InstanceId, Journal, ResumeState, Signal, StepId, StepOutcome, StepRecord};
+use crate::journal::{InstanceId, Journal, RegisteredInstance, ResumeState, Signal, StepId, StepOutcome, StepRecord};
 use crate::process::{parse_duration, ExecRequest};
 use crate::values::{
     eq_vals, json_to_value, secret_reference_name, value_to_echo_string, value_to_json, Value,
@@ -197,6 +197,32 @@ impl Journal for WorkflowPersistence {
         }
 
         Ok(ResumeState { records })
+    }
+
+    /// Zen has no cross-run dispatcher - `run_persisted`/`resume_persisted`
+    /// are always invoked with an explicit `run_id` already in hand, unlike
+    /// Flux's dispatcher, which discovers instances with none. Matches the
+    /// existing `suspend`/`deliver` no-op stub pattern above.
+    fn register_instance(
+        &mut self,
+        _instance: InstanceId,
+        _fn_name: String,
+        _args: Vec<Value>,
+        _source: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn list_incomplete_instances(&self) -> Result<Vec<InstanceId>, String> {
+        Ok(Vec::new())
+    }
+
+    fn mark_instance_completed(&mut self, _instance: InstanceId) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn lookup_instance(&self, _instance: &InstanceId) -> Result<Option<RegisteredInstance>, String> {
+        Ok(None)
     }
 }
 
