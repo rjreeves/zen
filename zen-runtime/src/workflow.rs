@@ -213,8 +213,12 @@ impl Journal for WorkflowPersistence {
         Ok(())
     }
 
-    fn list_suspended_instances(&self) -> Result<Vec<InstanceId>, String> {
+    fn list_incomplete_instances(&self) -> Result<Vec<InstanceId>, String> {
         Ok(Vec::new())
+    }
+
+    fn mark_instance_completed(&mut self, _instance: InstanceId) -> Result<(), String> {
+        Ok(())
     }
 
     fn lookup_instance(&self, _instance: &InstanceId) -> Result<Option<RegisteredInstance>, String> {

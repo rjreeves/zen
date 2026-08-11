@@ -88,7 +88,7 @@ pub trait Journal {
     /// re-registering the same instance with different args/fn_name is a
     /// caller bug, not a legitimate update, so first write wins). Exists so
     /// a dispatcher that only knows an `InstanceId` (from
-    /// `list_suspended_instances`) can resume it with no other input - see
+    /// `list_incomplete_instances`) can resume it with no other input - see
     /// `lookup_instance`. Zen has no dispatcher and stubs this to a no-op.
     fn register_instance(
         &mut self,
@@ -97,16 +97,29 @@ pub trait Journal {
         args: Vec<Value>,
         source: String,
     ) -> Result<(), String>;
-    /// Every instance currently suspended (has at least one row with
-    /// `status = 'suspended'`) - across *all* instances in this journal,
+    /// Every registered instance not yet marked completed via
+    /// `mark_instance_completed` - across *all* instances in this journal,
     /// not scoped to one `InstanceId` the way `append`/`suspend`/
     /// `deliver`/`resume` are. A dispatcher polls this to discover work
-    /// with no prior knowledge of which instance/fn/script produced it. An
-    /// instance never reappears here once fully completed: an awaiting
-    /// caller only gets back a completed result once every await it passed
-    /// through already has a `Done` record, so a completed run can never
-    /// still own a `status='suspended'` row.
-    fn list_suspended_instances(&self) -> Result<Vec<InstanceId>, String>;
+    /// with no prior knowledge of which instance/fn/script produced it.
+    /// Deliberately **not** "has a row with `status = 'suspended'`" -
+    /// `deliver` already flips a delivered step's own row straight to
+    /// 'done', independent of whether the durable fn's remaining
+    /// orchestration body has actually been re-run past that point. An
+    /// instance stays listed here until something explicitly calls
+    /// `mark_instance_completed` for it, which only happens once a real
+    /// resume genuinely finishes the whole call, not merely once one of
+    /// its awaits is delivered.
+    fn list_incomplete_instances(&self) -> Result<Vec<InstanceId>, String>;
+    /// Durably marks `instance` as fully completed - called once resuming
+    /// it genuinely finishes the whole durable fn call (not merely once an
+    /// individual awaited signal is delivered: delivering only unblocks
+    /// one step, the fn's remaining orchestration body - possibly more
+    /// steps, possibly another `await` - still needs to actually run
+    /// before the *instance* itself is done). This is what lets
+    /// `list_incomplete_instances` tell "still needs resuming" apart from
+    /// "delivered but not yet resumed" - the two are not the same thing.
+    fn mark_instance_completed(&mut self, instance: InstanceId) -> Result<(), String>;
     /// Looks up what `register_instance` recorded for `instance`, if
     /// anything - `None` if never registered (or this journal has no
     /// dispatcher-facing metadata at all, e.g. Zen).

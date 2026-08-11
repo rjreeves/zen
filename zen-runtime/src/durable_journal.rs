@@ -49,7 +49,8 @@ impl SqliteJournal {
                 fn_name TEXT NOT NULL,
                 args_json TEXT NOT NULL,
                 source TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                completed_at TEXT
             )",
         )
         .map_err(|error| format!("Failed to initialize durable_steps/durable_instances tables: {error}"))?;
@@ -238,21 +239,38 @@ impl Journal for SqliteJournal {
         Ok(())
     }
 
-    fn list_suspended_instances(&self) -> Result<Vec<InstanceId>, String> {
+    fn list_incomplete_instances(&self) -> Result<Vec<InstanceId>, String> {
+        // Deliberately queries `durable_instances.completed_at`, NOT
+        // `durable_steps.status = 'suspended'` — `deliver` already flips a
+        // delivered step's own row straight to 'done', independent of
+        // whether the durable fn's remaining orchestration body has
+        // actually been re-run past that point. A registered-but-not-yet-
+        // fully-resumed instance must stay discoverable even though none
+        // of its steps currently read 'suspended' any more.
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT instance_id FROM durable_steps WHERE status = 'suspended'")
-            .map_err(|error| format!("Failed to prepare list_suspended_instances query: {error}"))?;
+            .prepare("SELECT instance_id FROM durable_instances WHERE completed_at IS NULL")
+            .map_err(|error| format!("Failed to prepare list_incomplete_instances query: {error}"))?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("Failed to run list_suspended_instances query: {error}"))?;
+            .map_err(|error| format!("Failed to run list_incomplete_instances query: {error}"))?;
         let mut instances = Vec::new();
         for row in rows {
             instances.push(InstanceId(
-                row.map_err(|error| format!("Failed to read a durable_steps row: {error}"))?,
+                row.map_err(|error| format!("Failed to read a durable_instances row: {error}"))?,
             ));
         }
         Ok(instances)
+    }
+
+    fn mark_instance_completed(&mut self, instance: InstanceId) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE durable_instances SET completed_at = datetime('now') WHERE instance_id = ?1",
+                params![instance.0],
+            )
+            .map_err(|error| format!("Failed to mark instance '{}' completed: {error}", instance.0))?;
+        Ok(())
     }
 
     fn lookup_instance(&self, instance: &InstanceId) -> Result<Option<RegisteredInstance>, String> {
@@ -633,45 +651,73 @@ mod tests {
     }
 
     #[test]
-    fn list_suspended_instances_finds_multiple_distinct_suspended_instances_and_excludes_a_done_one() {
-        let path = temp_db_path("list-suspended-multiple");
+    fn list_incomplete_instances_finds_multiple_registered_instances_and_excludes_a_completed_one() {
+        let path = temp_db_path("list-incomplete-multiple");
         let mut journal_a = SqliteJournal::open(&path, InstanceId("instance-a".into())).unwrap();
+        journal_a
+            .register_instance(InstanceId("instance-a".into()), "f".into(), vec![], "src".into())
+            .unwrap();
         journal_a
             .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go-a".into()))
             .unwrap();
         let mut journal_b = SqliteJournal::open(&path, InstanceId("instance-b".into())).unwrap();
         journal_b
+            .register_instance(InstanceId("instance-b".into()), "f".into(), vec![], "src".into())
+            .unwrap();
+        journal_b
             .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go-b".into()))
             .unwrap();
         let mut journal_c = SqliteJournal::open(&path, InstanceId("instance-c".into())).unwrap();
         journal_c
+            .register_instance(InstanceId("instance-c".into()), "f".into(), vec![], "src".into())
+            .unwrap();
+        journal_c
             .append(StepId { call_site: "compile#0".into(), loop_key: None }, StepOutcome::Done(Value::Bool(true)))
             .unwrap();
+        journal_c.mark_instance_completed(InstanceId("instance-c".into())).unwrap();
 
-        let mut suspended: Vec<String> = journal_c.list_suspended_instances().unwrap().into_iter().map(|id| id.0).collect();
-        suspended.sort();
-        assert_eq!(suspended, vec!["instance-a".to_string(), "instance-b".to_string()]);
+        let mut incomplete: Vec<String> = journal_c.list_incomplete_instances().unwrap().into_iter().map(|id| id.0).collect();
+        incomplete.sort();
+        assert_eq!(incomplete, vec!["instance-a".to_string(), "instance-b".to_string()]);
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn list_suspended_instances_excludes_an_instance_once_its_await_is_delivered() {
-        let path = temp_db_path("list-suspended-then-delivered");
+    fn list_incomplete_instances_still_includes_an_instance_after_delivery_until_marked_completed() {
+        // The bug this guards against: `deliver` flips the delivered
+        // step's own `durable_steps` row straight to 'done', independent
+        // of whether the durable fn's remaining orchestration body has
+        // ever actually been re-run. A dispatcher relying on "no longer
+        // has a suspended step" to mean "done" would silently stop
+        // discovering an instance the moment it's delivered, even though
+        // nobody has resumed it to real completion yet.
+        let path = temp_db_path("list-incomplete-then-delivered");
         let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        journal
+            .register_instance(InstanceId("instance-1".into()), "f".into(), vec![], "src".into())
+            .unwrap();
         journal
             .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go".into()))
             .unwrap();
 
-        let suspended = journal.list_suspended_instances().unwrap();
-        assert!(suspended.iter().any(|id| id.0 == "instance-1"), "expected instance-1 to be listed while suspended");
+        let incomplete = journal.list_incomplete_instances().unwrap();
+        assert!(incomplete.iter().any(|id| id.0 == "instance-1"), "expected instance-1 to be listed while suspended");
 
         journal.deliver(Signal("go".into()), Value::Bool(true)).unwrap();
 
-        let suspended_after_delivery = journal.list_suspended_instances().unwrap();
+        let incomplete_after_delivery = journal.list_incomplete_instances().unwrap();
         assert!(
-            !suspended_after_delivery.iter().any(|id| id.0 == "instance-1"),
-            "expected instance-1 to no longer be listed once its only suspended step was delivered"
+            incomplete_after_delivery.iter().any(|id| id.0 == "instance-1"),
+            "expected instance-1 to STILL be listed after delivery - delivery alone doesn't mean resumed"
+        );
+
+        journal.mark_instance_completed(InstanceId("instance-1".into())).unwrap();
+
+        let incomplete_after_completion = journal.list_incomplete_instances().unwrap();
+        assert!(
+            !incomplete_after_completion.iter().any(|id| id.0 == "instance-1"),
+            "expected instance-1 to no longer be listed once explicitly marked completed"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -691,8 +737,8 @@ mod tests {
         }
 
         let dispatch_journal = SqliteJournal::open_for_dispatch(&path).unwrap();
-        let suspended = dispatch_journal.list_suspended_instances().unwrap();
-        assert!(suspended.iter().any(|id| id.0 == "instance-1"));
+        let incomplete = dispatch_journal.list_incomplete_instances().unwrap();
+        assert!(incomplete.iter().any(|id| id.0 == "instance-1"));
         let registered = dispatch_journal.lookup_instance(&InstanceId("instance-1".into())).unwrap();
         assert!(registered.is_some(), "expected open_for_dispatch's placeholder InstanceId to not scope lookup_instance");
 
