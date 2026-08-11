@@ -46,6 +46,19 @@ pub struct InstanceId(pub String);
 /// exists so the trait shape matches what Flux needs.
 pub struct Signal(pub String);
 
+/// Everything `register_instance` durably recorded about an instance at
+/// its first registration - what a dispatcher needs to auto-discover and
+/// resume a suspended instance knowing nothing but its `InstanceId`. The
+/// full script *source* (not a path) is captured, not just referenced, so
+/// resume always replays the exact text that produced this journal's
+/// existing rows, even if the source file on disk changes later.
+#[derive(Debug, Clone)]
+pub struct RegisteredInstance {
+    pub fn_name: String,
+    pub args: Vec<Value>,
+    pub source: String,
+}
+
 /// Everything the journal already knows about an instance, keyed by
 /// `StepId`. A replay walks its own steps and calls `lookup` per step -
 /// unlike Flux (where the *engine* replays compiled code), Zen's engine
@@ -70,4 +83,32 @@ pub trait Journal {
     /// done.
     fn deliver(&mut self, signal: Signal, value: Value) -> Result<Option<StepId>, String>;
     fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String>;
+    /// Durably records which script/fn/args produced `instance`, the first
+    /// time it's seen - idempotent (`INSERT OR IGNORE`: a caller
+    /// re-registering the same instance with different args/fn_name is a
+    /// caller bug, not a legitimate update, so first write wins). Exists so
+    /// a dispatcher that only knows an `InstanceId` (from
+    /// `list_suspended_instances`) can resume it with no other input - see
+    /// `lookup_instance`. Zen has no dispatcher and stubs this to a no-op.
+    fn register_instance(
+        &mut self,
+        instance: InstanceId,
+        fn_name: String,
+        args: Vec<Value>,
+        source: String,
+    ) -> Result<(), String>;
+    /// Every instance currently suspended (has at least one row with
+    /// `status = 'suspended'`) - across *all* instances in this journal,
+    /// not scoped to one `InstanceId` the way `append`/`suspend`/
+    /// `deliver`/`resume` are. A dispatcher polls this to discover work
+    /// with no prior knowledge of which instance/fn/script produced it. An
+    /// instance never reappears here once fully completed: an awaiting
+    /// caller only gets back a completed result once every await it passed
+    /// through already has a `Done` record, so a completed run can never
+    /// still own a `status='suspended'` row.
+    fn list_suspended_instances(&self) -> Result<Vec<InstanceId>, String>;
+    /// Looks up what `register_instance` recorded for `instance`, if
+    /// anything - `None` if never registered (or this journal has no
+    /// dispatcher-facing metadata at all, e.g. Zen).
+    fn lookup_instance(&self, instance: &InstanceId) -> Result<Option<RegisteredInstance>, String>;
 }

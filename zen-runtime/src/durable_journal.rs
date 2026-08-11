@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::journal::{InstanceId, Journal, ResumeState, Signal, StepId, StepOutcome, StepRecord};
+use crate::journal::{InstanceId, Journal, RegisteredInstance, ResumeState, Signal, StepId, StepOutcome, StepRecord};
 use crate::values::{json_to_value, value_to_json, Value};
 
 pub struct SqliteJournal {
@@ -27,11 +27,11 @@ pub struct SqliteJournal {
 }
 
 impl SqliteJournal {
-    /// Opens (creating if needed) a durable-steps table at `db_path`,
-    /// scoped to `instance`. Does **not** prefetch existing rows - call
-    /// `resume` (via the `Journal` trait) to populate the cache from
-    /// storage, matching `WorkflowPersistence`'s existing "prefetch once"
-    /// pattern (see its own `resume` doc comment).
+    /// Opens (creating if needed) `durable_steps`/`durable_instances` at
+    /// `db_path`, scoped to `instance`. Does **not** prefetch existing
+    /// rows - call `resume` (via the `Journal` trait) to populate the
+    /// cache from storage, matching `WorkflowPersistence`'s existing
+    /// "prefetch once" pattern (see its own `resume` doc comment).
     pub fn open(db_path: &str, instance: InstanceId) -> Result<Self, String> {
         let conn = Connection::open(db_path).map_err(|error| format!("Failed to open '{db_path}': {error}"))?;
         conn.execute_batch(
@@ -43,10 +43,29 @@ impl SqliteJournal {
                 result_json TEXT,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (instance_id, call_site, loop_key)
+            );
+            CREATE TABLE IF NOT EXISTS durable_instances (
+                instance_id TEXT PRIMARY KEY,
+                fn_name TEXT NOT NULL,
+                args_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )",
         )
-        .map_err(|error| format!("Failed to initialize durable_steps table: {error}"))?;
+        .map_err(|error| format!("Failed to initialize durable_steps/durable_instances tables: {error}"))?;
         Ok(Self { conn, instance, cache: HashMap::new() })
+    }
+
+    /// Opens a journal for dispatcher use - `register_instance`/
+    /// `list_suspended_instances`/`lookup_instance` are all either
+    /// instance-agnostic or take an explicit `instance` argument, so no
+    /// single `InstanceId` needs to be known up front the way
+    /// `append`/`suspend`/`deliver`/`resume` require (only those four ever
+    /// read `self.instance`). Internally just `open` with a placeholder
+    /// empty `InstanceId` those four never consult - only call the three
+    /// dispatch-oriented methods against a journal opened this way.
+    pub fn open_for_dispatch(db_path: &str) -> Result<Self, String> {
+        Self::open(db_path, InstanceId(String::new()))
     }
 }
 
@@ -199,6 +218,69 @@ impl Journal for SqliteJournal {
         }
         self.cache = records.clone();
         Ok(ResumeState { records })
+    }
+
+    fn register_instance(
+        &mut self,
+        instance: InstanceId,
+        fn_name: String,
+        args: Vec<Value>,
+        source: String,
+    ) -> Result<(), String> {
+        let args_json = value_to_json(&Value::List(args)).to_string();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO durable_instances (instance_id, fn_name, args_json, source, created_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                params![instance.0, fn_name, args_json, source],
+            )
+            .map_err(|error| format!("Failed to register instance '{}': {error}", instance.0))?;
+        Ok(())
+    }
+
+    fn list_suspended_instances(&self) -> Result<Vec<InstanceId>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT instance_id FROM durable_steps WHERE status = 'suspended'")
+            .map_err(|error| format!("Failed to prepare list_suspended_instances query: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("Failed to run list_suspended_instances query: {error}"))?;
+        let mut instances = Vec::new();
+        for row in rows {
+            instances.push(InstanceId(
+                row.map_err(|error| format!("Failed to read a durable_steps row: {error}"))?,
+            ));
+        }
+        Ok(instances)
+    }
+
+    fn lookup_instance(&self, instance: &InstanceId) -> Result<Option<RegisteredInstance>, String> {
+        let row: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT fn_name, args_json, source FROM durable_instances WHERE instance_id = ?1",
+                params![instance.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query registered instance '{}': {error}", instance.0))?;
+
+        let Some((fn_name, args_json, source)) = row else {
+            return Ok(None);
+        };
+        let json: serde_json::Value = serde_json::from_str(&args_json)
+            .map_err(|error| format!("Failed to parse registered instance args: {error}"))?;
+        let args = match json_to_value(json) {
+            Value::List(items) => items,
+            other => {
+                return Err(format!(
+                    "registered instance '{}' args_json did not decode to a list, got {other:?}",
+                    instance.0
+                ))
+            }
+        };
+        Ok(Some(RegisteredInstance { fn_name, args, source }))
     }
 }
 
@@ -474,6 +556,145 @@ mod tests {
             mismatches.len(),
             &mismatches[..mismatches.len().min(5)]
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_instance_then_lookup_round_trips() {
+        let path = temp_db_path("register-roundtrip");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+
+        journal
+            .register_instance(
+                InstanceId("instance-1".into()),
+                "release".into(),
+                vec![Value::Number(42.0)],
+                "durable fn release(n) { await(\"go\") }".into(),
+            )
+            .unwrap();
+
+        let registered = journal.lookup_instance(&InstanceId("instance-1".into())).unwrap().unwrap();
+        assert_eq!(registered.fn_name, "release");
+        assert!(matches!(registered.args.as_slice(), [Value::Number(n)] if *n == 42.0));
+        assert_eq!(registered.source, "durable fn release(n) { await(\"go\") }");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_instance_is_idempotent_first_write_wins() {
+        let path = temp_db_path("register-idempotent");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+
+        journal
+            .register_instance(InstanceId("instance-1".into()), "first_fn".into(), vec![Value::Number(1.0)], "src-1".into())
+            .unwrap();
+        journal
+            .register_instance(InstanceId("instance-1".into()), "second_fn".into(), vec![Value::Number(2.0)], "src-2".into())
+            .unwrap();
+
+        let registered = journal.lookup_instance(&InstanceId("instance-1".into())).unwrap().unwrap();
+        assert_eq!(registered.fn_name, "first_fn", "expected the first registration to win");
+        assert_eq!(registered.source, "src-1");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn lookup_instance_with_no_registration_returns_none() {
+        let path = temp_db_path("lookup-no-registration");
+        let journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+
+        let registered = journal.lookup_instance(&InstanceId("never-registered".into())).unwrap();
+        assert!(registered.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_instance_is_durable_across_a_fresh_connection() {
+        let path = temp_db_path("register-durable-across-reopen");
+        let instance = InstanceId("instance-1".into());
+
+        {
+            let mut journal = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+            journal
+                .register_instance(InstanceId(instance.0.clone()), "release".into(), vec![], "src".into())
+                .unwrap();
+            // journal (and its Connection) dropped here.
+        }
+
+        let reopened = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+        let registered = reopened.lookup_instance(&InstanceId(instance.0.clone())).unwrap();
+        assert!(registered.is_some(), "expected the registration to have survived reopening the connection");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_suspended_instances_finds_multiple_distinct_suspended_instances_and_excludes_a_done_one() {
+        let path = temp_db_path("list-suspended-multiple");
+        let mut journal_a = SqliteJournal::open(&path, InstanceId("instance-a".into())).unwrap();
+        journal_a
+            .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go-a".into()))
+            .unwrap();
+        let mut journal_b = SqliteJournal::open(&path, InstanceId("instance-b".into())).unwrap();
+        journal_b
+            .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go-b".into()))
+            .unwrap();
+        let mut journal_c = SqliteJournal::open(&path, InstanceId("instance-c".into())).unwrap();
+        journal_c
+            .append(StepId { call_site: "compile#0".into(), loop_key: None }, StepOutcome::Done(Value::Bool(true)))
+            .unwrap();
+
+        let mut suspended: Vec<String> = journal_c.list_suspended_instances().unwrap().into_iter().map(|id| id.0).collect();
+        suspended.sort();
+        assert_eq!(suspended, vec!["instance-a".to_string(), "instance-b".to_string()]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_suspended_instances_excludes_an_instance_once_its_await_is_delivered() {
+        let path = temp_db_path("list-suspended-then-delivered");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        journal
+            .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go".into()))
+            .unwrap();
+
+        let suspended = journal.list_suspended_instances().unwrap();
+        assert!(suspended.iter().any(|id| id.0 == "instance-1"), "expected instance-1 to be listed while suspended");
+
+        journal.deliver(Signal("go".into()), Value::Bool(true)).unwrap();
+
+        let suspended_after_delivery = journal.list_suspended_instances().unwrap();
+        assert!(
+            !suspended_after_delivery.iter().any(|id| id.0 == "instance-1"),
+            "expected instance-1 to no longer be listed once its only suspended step was delivered"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_for_dispatch_sees_rows_written_via_a_plain_open_connection() {
+        let path = temp_db_path("open-for-dispatch");
+        {
+            let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+            journal
+                .register_instance(InstanceId("instance-1".into()), "release".into(), vec![], "src".into())
+                .unwrap();
+            journal
+                .suspend(StepId { call_site: "approval#0".into(), loop_key: None }, Signal("go".into()))
+                .unwrap();
+        }
+
+        let dispatch_journal = SqliteJournal::open_for_dispatch(&path).unwrap();
+        let suspended = dispatch_journal.list_suspended_instances().unwrap();
+        assert!(suspended.iter().any(|id| id.0 == "instance-1"));
+        let registered = dispatch_journal.lookup_instance(&InstanceId("instance-1".into())).unwrap();
+        assert!(registered.is_some(), "expected open_for_dispatch's placeholder InstanceId to not scope lookup_instance");
 
         let _ = std::fs::remove_file(&path);
     }
