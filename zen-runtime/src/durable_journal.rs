@@ -51,9 +51,14 @@ impl SqliteJournal {
                 source TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS durable_instance_locks (
+                instance_id TEXT PRIMARY KEY,
+                locked_at TEXT NOT NULL,
+                pid INTEGER NOT NULL
             )",
         )
-        .map_err(|error| format!("Failed to initialize durable_steps/durable_instances tables: {error}"))?;
+        .map_err(|error| format!("Failed to initialize durable_steps/durable_instances/durable_instance_locks tables: {error}"))?;
         Ok(Self { conn, instance, cache: HashMap::new() })
     }
 
@@ -300,6 +305,67 @@ impl Journal for SqliteJournal {
         };
         Ok(Some(RegisteredInstance { fn_name, args, source }))
     }
+
+    fn try_lock_instance(&mut self, instance: &InstanceId) -> Result<bool, String> {
+        let pid = std::process::id();
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|error| format!("Failed to start lock transaction: {error}"))?;
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT pid FROM durable_instance_locks WHERE instance_id = ?1",
+                params![instance.0],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to read lock row for '{}': {error}", instance.0))?;
+        if let Some(holder_pid) = existing {
+            if pid_is_alive(holder_pid as u32) {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE durable_instance_locks SET locked_at = datetime('now'), pid = ?2 WHERE instance_id = ?1",
+                params![instance.0, pid],
+            )
+        } else {
+            tx.execute(
+                "INSERT INTO durable_instance_locks (instance_id, locked_at, pid) VALUES (?1, datetime('now'), ?2)",
+                params![instance.0, pid],
+            )
+        }
+        .map_err(|error| format!("Failed to claim lock for '{}': {error}", instance.0))?;
+        tx.commit()
+            .map_err(|error| format!("Failed to commit lock claim for '{}': {error}", instance.0))?;
+        Ok(true)
+    }
+
+    fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM durable_instance_locks WHERE instance_id = ?1 AND pid = ?2",
+                params![instance.0, std::process::id()],
+            )
+            .map_err(|error| format!("Failed to release lock for '{}': {error}", instance.0))?;
+        Ok(())
+    }
+}
+
+/// Whether `pid` currently identifies a running OS process — used by
+/// `try_lock_instance` to decide whether an existing lock row was
+/// abandoned by a crashed holder (safe to reclaim) or still belongs to a
+/// live one (must not steal it). A known, accepted, industry-standard
+/// limitation: PID reuse could in rare cases make a dead-then-recycled PID
+/// look alive again, or (far more narrowly) a lock check could race a
+/// brand-new process being assigned the exact PID just freed by the real
+/// holder's exit — single-machine only, no cross-host story.
+fn pid_is_alive(pid: u32) -> bool {
+    let mut system = sysinfo::System::new_all();
+    system.refresh_all();
+    system
+        .processes()
+        .keys()
+        .any(|candidate| candidate.as_u32() == pid)
 }
 
 #[cfg(test)]
@@ -741,6 +807,104 @@ mod tests {
         assert!(incomplete.iter().any(|id| id.0 == "instance-1"));
         let registered = dispatch_journal.lookup_instance(&InstanceId("instance-1".into())).unwrap();
         assert!(registered.is_some(), "expected open_for_dispatch's placeholder InstanceId to not scope lookup_instance");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn try_lock_instance_succeeds_when_unlocked() {
+        let path = temp_db_path("lock-fresh");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+
+        let acquired = journal.try_lock_instance(&InstanceId("instance-1".into())).unwrap();
+        assert!(acquired, "expected the lock to be acquired when no row exists yet");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn try_lock_instance_fails_when_already_locked_by_a_live_process() {
+        let path = temp_db_path("lock-contended");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let instance = InstanceId("instance-1".into());
+
+        // Lock the row directly with this *test process's own* pid - it's
+        // definitely alive, standing in for a genuinely concurrent holder.
+        journal
+            .conn
+            .execute(
+                "INSERT INTO durable_instance_locks (instance_id, locked_at, pid) VALUES (?1, datetime('now'), ?2)",
+                params![instance.0, std::process::id()],
+            )
+            .unwrap();
+
+        let acquired = journal.try_lock_instance(&instance).unwrap();
+        assert!(!acquired, "expected the lock to be refused while a live process holds it");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn try_lock_instance_reclaims_a_lock_held_by_a_dead_pid() {
+        let path = temp_db_path("lock-stale");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let instance = InstanceId("instance-1".into());
+
+        // A trivial, fast-exiting child process - waited on, so its pid is
+        // genuinely dead by the time we use it, not just an assumed-unused
+        // number that happens not to be running right now.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("failed to spawn a throwaway child process");
+        let dead_pid = child.id();
+        child.wait().expect("failed to wait for the throwaway child process");
+
+        journal
+            .conn
+            .execute(
+                "INSERT INTO durable_instance_locks (instance_id, locked_at, pid) VALUES (?1, datetime('now'), ?2)",
+                params![instance.0, dead_pid],
+            )
+            .unwrap();
+
+        let acquired = journal.try_lock_instance(&instance).unwrap();
+        assert!(acquired, "expected a lock held by a dead pid to be reclaimed");
+
+        let holder_pid: i64 = journal
+            .conn
+            .query_row(
+                "SELECT pid FROM durable_instance_locks WHERE instance_id = ?1",
+                params![instance.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder_pid as u32, std::process::id(), "expected the row to now show this process's own pid");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unlock_instance_removes_the_row_and_a_second_lock_attempt_then_succeeds() {
+        let path = temp_db_path("unlock");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let instance = InstanceId("instance-1".into());
+
+        assert!(journal.try_lock_instance(&instance).unwrap());
+        journal.unlock_instance(&instance).unwrap();
+
+        let row_count: i64 = journal
+            .conn
+            .query_row("SELECT COUNT(*) FROM durable_instance_locks WHERE instance_id = ?1", params![instance.0], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(row_count, 0, "expected unlock_instance to remove the row entirely");
+
+        assert!(
+            journal.try_lock_instance(&instance).unwrap(),
+            "expected a second lock attempt to succeed once the first was released"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

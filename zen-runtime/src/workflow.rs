@@ -224,6 +224,17 @@ impl Journal for WorkflowPersistence {
     fn lookup_instance(&self, _instance: &InstanceId) -> Result<Option<RegisteredInstance>, String> {
         Ok(None)
     }
+
+    /// Zen has no concurrent-replay story of its own — a single
+    /// `WorkflowEngine` process runs one workflow at a time — so there's
+    /// nothing to coordinate against; always succeeds.
+    fn try_lock_instance(&mut self, _instance: &InstanceId) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    fn unlock_instance(&mut self, _instance: &InstanceId) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Runs `workflow.run` workflows against a `WorkflowHost` instead of the
