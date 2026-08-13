@@ -124,4 +124,26 @@ pub trait Journal {
     /// anything - `None` if never registered (or this journal has no
     /// dispatcher-facing metadata at all, e.g. Zen).
     fn lookup_instance(&self, instance: &InstanceId) -> Result<Option<RegisteredInstance>, String>;
+    /// Attempts to exclusively claim `instance` for the duration of a
+    /// replay - closes a real check-then-act race: without this, two
+    /// processes racing to resume the same suspended instance can both see
+    /// a step as un-journaled (each has its own in-memory cache from its
+    /// own `resume` call), both fire its real effects, and whichever
+    /// `append`s second silently overwrites the first's journaled result
+    /// with no error surfaced anywhere. `Ok(true)` if the lock was
+    /// acquired - either freshly, or reclaimed from a holder whose OS
+    /// process no longer exists (checked via PID liveness, not a blind
+    /// timeout); `Ok(false)` if a live process currently holds it. Zen has
+    /// no concurrent-replay story of its own (a single `WorkflowEngine`
+    /// process) and stubs this to always succeed.
+    fn try_lock_instance(&mut self, instance: &InstanceId) -> Result<bool, String>;
+    /// Releases a lock this same process previously acquired via
+    /// `try_lock_instance`. Must be called on every exit path - success,
+    /// business error, or genuine failure - see `flux-lang`'s
+    /// `run_durable_with_outcome`, which guarantees this via ordinary
+    /// sequential code (capture the inner call's `Result`, always unlock,
+    /// then return it) rather than a `Drop` guard, since a guard holding
+    /// `&mut dyn Journal` would conflict with the rest of the function also
+    /// needing it mutably.
+    fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String>;
 }
