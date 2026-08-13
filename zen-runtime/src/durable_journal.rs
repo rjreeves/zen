@@ -34,6 +34,16 @@ impl SqliteJournal {
     /// "prefetch once" pattern (see its own `resume` doc comment).
     pub fn open(db_path: &str, instance: InstanceId) -> Result<Self, String> {
         let conn = Connection::open(db_path).map_err(|error| format!("Failed to open '{db_path}': {error}"))?;
+        // rusqlite defaults to a 0ms busy timeout (an immediate `SQLITE_BUSY`
+        // error on any write that collides with another connection's
+        // in-flight transaction, rather than waiting). Harmless when this
+        // type is only ever used by one connection at a time, but
+        // `try_lock_instance`'s whole point is to be correct under genuine
+        // concurrent access from separate connections/processes — without
+        // this, a real collision could surface as a raw SQLite error instead
+        // of `try_lock_instance`'s own clean `Ok(false)`/lock-conflict path.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(|error| format!("Failed to set busy_timeout on '{db_path}': {error}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS durable_steps (
                 instance_id TEXT NOT NULL,
