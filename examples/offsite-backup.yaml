@@ -1,0 +1,120 @@
+# offsite-backup.yaml
+#
+# Zen conversion of BACKUP.RUN.CMD (a deterministic backup job wrapper
+# around BackupEngine.exe).
+#
+# Original CMD config, kept here for reference — Zen workflow `run:`
+# steps can't share a variable across steps the way `set` did, so these
+# literal paths are repeated in every step below:
+#
+#   JOB      = OffsiteBackup
+#   SRC      = C:\Data
+#   MANIFEST = C:\Backup\manifest.json
+#   RESUME   = C:\Backup\resume.token
+#   OUTLOG   = C:\Backup\backup.log
+#   TMP      = C:\Backup\.tmp\OffsiteBackup
+#              (fixed, not %RANDOM%-suffixed like the original — Zen's
+#              own checkpoint/resume already gives restart-safety
+#              across process crashes, so the temp dir no longer needs
+#              a random name purely to dodge collisions)
+#
+# What each CMD mechanism became:
+#   - manual "[date time] message" logging -> kept via PowerShell
+#     Add-Content to backup.log (so anything that tails that file still
+#     works), on top of Zen's own free run history (`zen runs`,
+#     `zen run-status <run-id>`) which already records every step,
+#     attempt, and error.
+#   - the :fail label (log + echo + exit /b 1) -> each step's
+#     `on_failure:` block, which only runs when that specific step fails.
+#   - resume.token restart-safety -> BackupEngine.exe still gets
+#     --resume for its own internal state (unchanged), AND every phase
+#     now has a `checkpoint:` so `zen resume <run-id> --yes` can skip
+#     phases that already succeeded if the wrapper itself gets killed
+#     mid-run.
+#
+# Run it:
+#   zen run examples\offsite-backup.yaml --yes
+#   zen runs
+#   zen run-status <run-id>
+#   zen resume <run-id> --yes   (after a crash, to continue mid-workflow)
+
+name: offsite-backup
+
+requires:
+  - proc.exec
+
+steps:
+  - name: log-job-started
+    run: "powershell -NoProfile -Command \"if (-not (Test-Path 'C:\\Backup\\backup.log')) { Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] LOG CREATED') }; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB STARTED')\""
+
+  - name: preflight-temp-workspace
+    run: "powershell -NoProfile -Command \"try { New-Item -ItemType Directory -Force -Path 'C:\\Backup\\.tmp\\OffsiteBackup' -ErrorAction Stop | Out-Null } catch { exit 1 }; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Pre-flight: creating temp workspace C:\\Backup\\.tmp\\OffsiteBackup')\""
+    checkpoint: preflight-done
+    on_failure:
+      - run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] ERROR: Unable to create temp directory'); Write-Host 'ERROR: Unable to create temp directory'; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB FAILED')\""
+
+  - name: check-manifest
+    # A `run:` step's own exit code drives Zen's success/failure tracking for
+    # that step (unlike a `zen:` plugin call), so this always exits 0 and
+    # carries the true/false result in stdout instead - an `exit 1` here
+    # would mark the step (and the whole workflow) failed just for a
+    # missing-manifest check.
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Pre-flight: checking manifest'); if (Test-Path 'C:\\Backup\\manifest.json') { [Console]::Out.Write('true') } else { [Console]::Out.Write('false') }\""
+    save_as: manifest_check
+
+  - name: generate-manifest
+    if: outputs.manifest_check.stdout == "false"
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Manifest missing - generating new manifest'); try { & 'BackupEngine.exe' gen-manifest --source 'C:\\Data' --output 'C:\\Backup\\manifest.json'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host $_.Exception.Message; exit 1 }\""
+    save_as: gen_manifest
+    checkpoint: manifest-generated
+    on_failure:
+      - run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] ERROR: Manifest generation failed'); Write-Host 'ERROR: Manifest generation failed'; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB FAILED')\""
+
+  - name: check-resume-token
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Checking resume token'); if (Test-Path 'C:\\Backup\\resume.token') { [Console]::Out.Write('true') } else { [Console]::Out.Write('false') }\""
+    save_as: resume_check
+
+  - name: log-resume-continuing
+    if: outputs.resume_check.stdout == "true"
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Resume token found - continuing previous backup')\""
+
+  - name: create-resume-token
+    if: outputs.resume_check.stdout == "false"
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] No resume token - starting fresh backup'); Set-Content -Path 'C:\\Backup\\resume.token' -Value 'START' -NoNewline\""
+
+  - name: scan-source
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Phase 1: Scanning source'); try { & 'BackupEngine.exe' scan --source 'C:\\Data' --manifest 'C:\\Backup\\manifest.json' --resume 'C:\\Backup\\resume.token'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host $_.Exception.Message; exit 1 }\""
+    save_as: scan
+    checkpoint: scan-done
+    on_failure:
+      - run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] ERROR: Scan failed'); Write-Host 'ERROR: Scan failed'; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB FAILED')\""
+
+  - name: upload-changed-blocks
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Phase 2: Uploading changed blocks'); try { & 'BackupEngine.exe' upload --manifest 'C:\\Backup\\manifest.json' --resume 'C:\\Backup\\resume.token' --log 'C:\\Backup\\.tmp\\OffsiteBackup\\upload.log'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host $_.Exception.Message; exit 1 }\""
+    save_as: upload
+    checkpoint: upload-done
+    on_failure:
+      - run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] ERROR: Upload failed'); Write-Host 'ERROR: Upload failed'; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB FAILED')\""
+
+  - name: verify-remote-state
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Phase 3: Verifying remote state'); try { & 'BackupEngine.exe' verify --manifest 'C:\\Backup\\manifest.json' --resume 'C:\\Backup\\resume.token'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host $_.Exception.Message; exit 1 }\""
+    save_as: verify
+    checkpoint: verify-done
+    on_failure:
+      - run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] ERROR: Verification failed'); Write-Host 'ERROR: Verification failed'; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB FAILED')\""
+
+  - name: commit-backup
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Phase 4: Commit backup'); try { & 'BackupEngine.exe' commit --manifest 'C:\\Backup\\manifest.json' --resume 'C:\\Backup\\resume.token'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } catch { Write-Host $_.Exception.Message; exit 1 }\""
+    save_as: commit
+    checkpoint: commit-done
+    on_failure:
+      - run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] ERROR: Commit failed'); Write-Host 'ERROR: Commit failed'; Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB FAILED')\""
+
+  - name: cleanup-temp-workspace
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Cleaning up temp workspace'); Remove-Item -LiteralPath 'C:\\Backup\\.tmp\\OffsiteBackup' -Recurse -Force -ErrorAction SilentlyContinue\""
+
+  - name: remove-resume-token
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] Removing resume token'); Remove-Item -LiteralPath 'C:\\Backup\\resume.token' -Force -ErrorAction SilentlyContinue\""
+
+  - name: log-job-completed
+    run: "powershell -NoProfile -Command \"Add-Content -Path 'C:\\Backup\\backup.log' -Value ('[' + (Get-Date) + '] JOB COMPLETED OK')\""
