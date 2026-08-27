@@ -323,10 +323,11 @@ impl Journal for SqliteJournal {
     /// `open` already sets a 5s `busy_timeout` on this connection so
     /// SQLite's own busy handler retries internally too - but empirically
     /// that alone is not sufficient here: `zen-runtime/tests/
-    /// lock_stress.rs` reproduces many real, separate connections racing
-    /// to write the same file and getting a raw `SQLITE_BUSY` ("database
-    /// is locked") back in well under a millisecond, nowhere near the
-    /// configured timeout window (busy_timeout governs how long a single
+    /// try_lock_instance_stress.rs` reproduces many real, separate
+    /// connections racing to write the same file and getting a raw
+    /// `SQLITE_BUSY` ("database is locked") back in well under a
+    /// millisecond, nowhere near the configured timeout window
+    /// (busy_timeout governs how long a single
     /// blocked *lock acquisition* sleeps/retries inside one `step()` call;
     /// it doesn't guarantee every contending connection actually gets a
     /// chance to acquire the lock before giving up). Retrying the whole
