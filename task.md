@@ -194,3 +194,89 @@ result_json, updated_at)`, own file/path (a real integration pointing this at th
 serialization - no new dependency.
 
 `cargo test --workspace`: 279 (zen) + 28 (zen-runtime, up from 22), zero regressions.
+
+## Phase 3.4 follow-on - `deliver`, the `durable_instances` registry, and cross-process locking
+
+Three Flux-driven slices, each requested by `flux-lang`'s own `PHASE3-PLAN.md` as Flux's durable-fn
+work (`await`/suspension, then a system-wide dispatcher, then concurrent-replay safety) hit a real
+gap in what `Journal` and `SqliteJournal` could do. All additive to `zen-runtime`; `WorkflowPersistence`
+(Zen's own implementor) stubs every new method to a no-op/always-succeed default, since Zen has no
+suspension-and-resume-from-a-dispatcher story and no concurrent-replay story of its own (a single
+`WorkflowEngine` process). Landed as three merged branches: `flux/await-suspension`,
+`flux/dispatcher`, `flux/instance-lock`.
+
+**`Journal::deliver`** (`flux/await-suspension`, commit `c634621`) - `deliver(signal, value)` manually
+delivers a value to whichever suspended step is waiting on `signal`, returning the `StepId` now marked
+done (or `None` if nothing matches). Exists because Flux's new `await(<expr>)` needed a way to
+durably record "this signal arrived" independent of a live process - a caller re-invokes the durable
+fn separately afterward to actually resume past the `await`. `SqliteJournal::deliver` does a `SELECT`
+for the exact `(instance_id, call_site, loop_key)` primary key first, then an `UPDATE` keyed by that
+exact tuple - deliberately not a single predicate-based `UPDATE ... WHERE status='suspended' AND
+result_json=?`, since SQLite's bundled build has no portable `LIMIT` on `UPDATE` and a predicate-only
+form would silently mark every suspended row sharing that signal string as done in one call.
+
+**`durable_instances` registry** (`flux/dispatcher`, commits `ec32532`/`d55e622`) - three new trait
+methods plus a new table, letting a caller discover and resume *any* suspended instance in a journal
+knowing nothing but its `InstanceId` (what Flux's `--dispatch` needed - no more `--durable`/`--instance`
+required per invocation). `register_instance(instance, fn_name, args, source)`: idempotent
+(`INSERT OR IGNORE` - first write wins; a caller re-registering the same instance with different
+args/fn_name is treated as a caller bug, not an update), embedding the **full script source text**, not
+a path, so resume always replays the exact text that produced existing journal rows even if the
+`.flux`/source file is edited later. `list_incomplete_instances()`: every registered instance not yet
+marked completed - across *all* instances in the journal, unlike `append`/`suspend`/`deliver`/`resume`,
+which are scoped to one `InstanceId`. `lookup_instance(instance)`: returns what `register_instance`
+recorded (`fn_name`/`args`/`source`), or `None` if never registered.
+
+A real bug was caught before shipping, not just anticipated: the first version inferred an instance's
+discoverability from `durable_steps.status = 'suspended'` - but `deliver` already flips a delivered
+step's own row straight to `'done'`, completely independent of whether the durable fn's remaining
+orchestration body has ever actually been re-run. A dispatcher relying on that signal would silently
+and permanently stop discovering an instance the instant it was delivered, even though nobody had
+resumed it to real completion. Fixed by tracking completion at the *instance* level instead of
+inferring it from step state: new `mark_instance_completed(instance)`, called by the caller only once
+resuming genuinely finishes the whole orchestration body - not merely once one `await` resolves. New
+table, `durable_instances(instance_id, fn_name, args_json, source, created_at, completed_at)`, with
+`completed_at` starting `NULL`. `list_incomplete_instances_still_includes_an_instance_after_delivery_until_marked_completed`
+locks this in directly.
+
+**Exclusive instance locking with PID-liveness auto-reclaim** (`flux/instance-lock`, commits
+`cad211e`/`99acd88`) - closes a real, previously untested race in concurrent replay, confirmed by
+reading the code rather than just inferred: a step's journal check runs against an **in-memory cache**
+populated once at the start of a resume, so two processes racing to resume the same suspended instance
+each see "not journaled yet" for the same step, both fire its real effects, and whichever appends
+second silently clobbers the first's result with no error surfaced anywhere. Fixed with a new
+`durable_instance_locks(instance_id, locked_at, pid)` table - the same "let SQLite's own row-uniqueness
+be the coordination primitive" trick `register_instance`'s `INSERT OR IGNORE` already uses, now for
+exclusivity instead of idempotency. New `Journal::try_lock_instance`/`unlock_instance`; the claim
+(check-then-insert-or-update) runs inside one `rusqlite` transaction, making it atomic against a second
+racing claim attempt - the same guarantee that already makes `append`'s upsert safe. **Auto-reclaimed
+via OS PID-liveness** if the lock's holder has crashed (`sysinfo`, already a `zen-runtime` dependency,
+so no new one needed) - confirmed as the right call over "fail-fast forever, no reclaim": a lock that
+outlives its holder's crash forever would make crash-resilience *worse* than before this feature
+existed. Stated, accepted risk: PID reuse could in rare cases steal a still-live process's lock (a
+well-known limitation of PID-liveness checks) - single-machine only, matching this project's actual
+deployment model. `unlock_instance` only deletes a lock row matching *both* the instance and the
+calling process's own PID, so a process can never release a lock it doesn't hold.
+
+Also set a `busy_timeout` (5000ms) on `SqliteJournal`'s connection - rusqlite defaults to 0ms, an
+immediate `SQLITE_BUSY` error on any genuine write collision with no retry. A small, directly-related
+robustness fix surfaced while building the concurrent-replay test itself: without it, a real collision
+could bypass the lock's own clean conflict message with a raw SQLite error instead.
+
+Proven end-to-end from the Flux side with a real two-thread race (not sequenced/simulated): two
+threads, each with its own `SqliteJournal` connection, both attempt the same instance at the same
+instant via a `Barrier` - exactly one completes, the other is rejected immediately with a clear error,
+and the step's real effect fires exactly once, not twice.
+
+`cargo test --workspace`: 279 (zen) + 45 (zen-runtime, up from 28), zero regressions.
+
+## Current status
+
+Every trait method `flux-lang`'s `PHASE3-PLAN.md` has needed from `zen-runtime` through its own
+Tier 1 compilation, type-checking, and `flux-dba` work is already built and merged here - from that
+doc's own "Current status" section onward, essentially every subsequent Flux slice explicitly notes
+"no `zen-runtime` changes." There is no `zen-runtime` work presently queued from the Flux side; the
+next real trigger for touching this crate again is a new Flux slice that needs something new from the
+shared traits (e.g. crash-durable retry/rollback state, or a real multi-journal/event-bus dispatcher -
+both named as permanent, deliberately-deferred design boundaries in `PHASE3-PLAN.md`, not scheduled
+work).
