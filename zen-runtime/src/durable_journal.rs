@@ -316,12 +316,62 @@ impl Journal for SqliteJournal {
         Ok(Some(RegisteredInstance { fn_name, args, source }))
     }
 
+    /// Claims the exclusive per-instance replay lock, transparently
+    /// retrying a bounded number of times (short randomized backoff
+    /// between attempts) on a transient `SQLITE_BUSY` before giving up.
+    ///
+    /// `open` already sets a 5s `busy_timeout` on this connection so
+    /// SQLite's own busy handler retries internally too - but empirically
+    /// that alone is not sufficient here: `zen-runtime/tests/
+    /// try_lock_instance_stress.rs` reproduces many real, separate
+    /// connections racing to write the same file and getting a raw
+    /// `SQLITE_BUSY` ("database is locked") back in well under a
+    /// millisecond, nowhere near the configured timeout window
+    /// (busy_timeout governs how long a single
+    /// blocked *lock acquisition* sleeps/retries inside one `step()` call;
+    /// it doesn't guarantee every contending connection actually gets a
+    /// chance to acquire the lock before giving up). Retrying the whole
+    /// claim transaction here, at the application level, is what actually
+    /// closes that gap - this is this codebase's real, previously flaky
+    /// two-watcher-on-one-journal regression (`flux-cli/tests/run.rs`'s
+    /// `two_watchers_on_the_same_journal_file_both_still_resume_correctly`).
     fn try_lock_instance(&mut self, instance: &InstanceId) -> Result<bool, String> {
         let pid = std::process::id();
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|error| format!("Failed to start lock transaction: {error}"))?;
+        const MAX_ATTEMPTS: u32 = 100;
+        let mut attempt: u32 = 0;
+        loop {
+            match self.try_lock_instance_once(instance, pid) {
+                Ok(acquired) => return Ok(acquired),
+                Err(error) if error.is_busy() && attempt + 1 < MAX_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(retry_backoff(attempt));
+                }
+                Err(error) => return Err(error.into_message(&instance.0)),
+            }
+        }
+    }
+
+    fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM durable_instance_locks WHERE instance_id = ?1 AND pid = ?2",
+                params![instance.0, std::process::id()],
+            )
+            .map_err(|error| format!("Failed to release lock for '{}': {error}", instance.0))?;
+        Ok(())
+    }
+}
+
+impl SqliteJournal {
+    /// One attempt at the lock-claim transaction `try_lock_instance` wraps
+    /// with retries - identical logic to what used to be inline in
+    /// `try_lock_instance` itself, just returning the raw
+    /// [`LockAttemptError`] (which step failed, and the underlying
+    /// `rusqlite::Error`) instead of an already-formatted `String`, so the
+    /// caller can distinguish a retryable `SQLITE_BUSY` from everything
+    /// else before deciding whether to give up.
+    fn try_lock_instance_once(&mut self, instance: &InstanceId, pid: u32) -> Result<bool, LockAttemptError> {
+        let tx = self.conn.transaction().map_err(LockAttemptError::Transaction)?;
         let existing: Option<i64> = tx
             .query_row(
                 "SELECT pid FROM durable_instance_locks WHERE instance_id = ?1",
@@ -329,7 +379,7 @@ impl Journal for SqliteJournal {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|error| format!("Failed to read lock row for '{}': {error}", instance.0))?;
+            .map_err(LockAttemptError::ReadLockRow)?;
         if let Some(holder_pid) = existing {
             if pid_is_alive(holder_pid as u32) {
                 return Ok(false);
@@ -344,21 +394,61 @@ impl Journal for SqliteJournal {
                 params![instance.0, pid],
             )
         }
-        .map_err(|error| format!("Failed to claim lock for '{}': {error}", instance.0))?;
-        tx.commit()
-            .map_err(|error| format!("Failed to commit lock claim for '{}': {error}", instance.0))?;
+        .map_err(LockAttemptError::ClaimWrite)?;
+        tx.commit().map_err(LockAttemptError::Commit)?;
         Ok(true)
     }
+}
 
-    fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String> {
-        self.conn
-            .execute(
-                "DELETE FROM durable_instance_locks WHERE instance_id = ?1 AND pid = ?2",
-                params![instance.0, std::process::id()],
-            )
-            .map_err(|error| format!("Failed to release lock for '{}': {error}", instance.0))?;
-        Ok(())
+/// Which step of the lock-claim transaction failed, carrying the
+/// underlying `rusqlite::Error` so `try_lock_instance` can both (a) check
+/// whether it's a retryable `SQLITE_BUSY` and (b) - once retries are
+/// exhausted or the error isn't busy-related - reproduce the exact same
+/// per-step message `try_lock_instance` used to format inline.
+enum LockAttemptError {
+    Transaction(rusqlite::Error),
+    ReadLockRow(rusqlite::Error),
+    ClaimWrite(rusqlite::Error),
+    Commit(rusqlite::Error),
+}
+
+impl LockAttemptError {
+    fn is_busy(&self) -> bool {
+        let (Self::Transaction(error) | Self::ReadLockRow(error) | Self::ClaimWrite(error) | Self::Commit(error)) = self;
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(inner, _) if inner.code == rusqlite::ErrorCode::DatabaseBusy
+        )
     }
+
+    fn into_message(self, instance_id: &str) -> String {
+        match self {
+            Self::Transaction(error) => format!("Failed to start lock transaction: {error}"),
+            Self::ReadLockRow(error) => format!("Failed to read lock row for '{instance_id}': {error}"),
+            Self::ClaimWrite(error) => format!("Failed to claim lock for '{instance_id}': {error}"),
+            Self::Commit(error) => format!("Failed to commit lock claim for '{instance_id}': {error}"),
+        }
+    }
+}
+
+/// Dependency-free jitter for `try_lock_instance`'s retry backoff - same
+/// construction as `a_journaled_float_round_trips_exactly_across_many_real_values`'s
+/// stress test below (hash fresh OS-seeded entropy plus the current time
+/// into a small range). Not cryptographically random, just enough spread
+/// that many contending threads/processes don't retry in lockstep and
+/// re-collide every time. Ramps the base delay up (capped) with the
+/// attempt count so sustained contention backs off rather than hammering
+/// the file at a fixed rate.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(attempt);
+    hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let jitter_ms = hasher.finish() % 8; // 0..=7ms of jitter
+    let base_ms = u64::from(attempt).saturating_mul(2).min(50); // linear ramp, capped at 50ms
+    std::time::Duration::from_millis(base_ms + jitter_ms)
 }
 
 /// Whether `pid` currently identifies a running OS process — used by
