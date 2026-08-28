@@ -1,0 +1,8 @@
+[package]
+name = "zen-cli"
+version = "1.0.13"
+edition = "2021"
+description = "Zen CLI: run scripts, workflows, and the REPL"
+license = "MIT"
+
+[dependencies]

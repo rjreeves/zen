@@ -1,0 +1,9 @@
+[package]
+name = "zen-lang"
+version = "0.1.0"
+edition = "2021"
+description = "Zen language front end and runtime: lexer, parser, AST, and the .fg interpreter (executor, plugins), decoupled from the CLI"
+license = "MIT"
+
+[dependencies]
+zen-runtime = { path = "../zen-runtime" }
