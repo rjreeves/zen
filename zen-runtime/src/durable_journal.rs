@@ -44,31 +44,56 @@ impl SqliteJournal {
         // of `try_lock_instance`'s own clean `Ok(false)`/lock-conflict path.
         conn.busy_timeout(std::time::Duration::from_millis(5000))
             .map_err(|error| format!("Failed to set busy_timeout on '{db_path}': {error}"))?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS durable_steps (
-                instance_id TEXT NOT NULL,
-                call_site TEXT NOT NULL,
-                loop_key INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                result_json TEXT,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (instance_id, call_site, loop_key)
-            );
-            CREATE TABLE IF NOT EXISTS durable_instances (
-                instance_id TEXT PRIMARY KEY,
-                fn_name TEXT NOT NULL,
-                args_json TEXT NOT NULL,
-                source TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS durable_instance_locks (
-                instance_id TEXT PRIMARY KEY,
-                locked_at TEXT NOT NULL,
-                pid INTEGER NOT NULL
-            )",
-        )
-        .map_err(|error| format!("Failed to initialize durable_steps/durable_instances/durable_instance_locks tables: {error}"))?;
+        // Retried the same way `try_lock_instance` retries its own claim
+        // transaction, and for the identical reason: `busy_timeout` alone
+        // isn't sufficient under real concurrent access from many separate
+        // connections all opening the same file at once (exactly what
+        // `try_lock_instance_stress.rs` does — a fresh connection per
+        // attempt, 16 threads) — a colliding `CREATE TABLE IF NOT EXISTS`
+        // can surface a raw `SQLITE_BUSY` well under the busy_timeout
+        // window, same as a colliding lock-claim write can. Caught by CI
+        // (this repo's own newly-added workflow) the very first run after
+        // it was added — `try_lock_instance`'s fix only covered the
+        // lock-claim step, not this schema-init step, which turned out to
+        // be racy in exactly the same way.
+        let mut attempt: u32 = 0;
+        loop {
+            match conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS durable_steps (
+                    instance_id TEXT NOT NULL,
+                    call_site TEXT NOT NULL,
+                    loop_key INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (instance_id, call_site, loop_key)
+                );
+                CREATE TABLE IF NOT EXISTS durable_instances (
+                    instance_id TEXT PRIMARY KEY,
+                    fn_name TEXT NOT NULL,
+                    args_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS durable_instance_locks (
+                    instance_id TEXT PRIMARY KEY,
+                    locked_at TEXT NOT NULL,
+                    pid INTEGER NOT NULL
+                )",
+            ) {
+                Ok(()) => break,
+                Err(error) if is_sqlite_busy(&error) && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(retry_backoff(attempt));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to initialize durable_steps/durable_instances/durable_instance_locks tables: {error}"
+                    ))
+                }
+            }
+        }
         Ok(Self { conn, instance, cache: HashMap::new() })
     }
 
@@ -337,12 +362,11 @@ impl Journal for SqliteJournal {
     /// `two_watchers_on_the_same_journal_file_both_still_resume_correctly`).
     fn try_lock_instance(&mut self, instance: &InstanceId) -> Result<bool, String> {
         let pid = std::process::id();
-        const MAX_ATTEMPTS: u32 = 100;
         let mut attempt: u32 = 0;
         loop {
             match self.try_lock_instance_once(instance, pid) {
                 Ok(acquired) => return Ok(acquired),
-                Err(error) if error.is_busy() && attempt + 1 < MAX_ATTEMPTS => {
+                Err(error) if error.is_busy() && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS => {
                     attempt += 1;
                     std::thread::sleep(retry_backoff(attempt));
                 }
@@ -415,10 +439,7 @@ enum LockAttemptError {
 impl LockAttemptError {
     fn is_busy(&self) -> bool {
         let (Self::Transaction(error) | Self::ReadLockRow(error) | Self::ClaimWrite(error) | Self::Commit(error)) = self;
-        matches!(
-            error,
-            rusqlite::Error::SqliteFailure(inner, _) if inner.code == rusqlite::ErrorCode::DatabaseBusy
-        )
+        is_sqlite_busy(error)
     }
 
     fn into_message(self, instance_id: &str) -> String {
@@ -431,7 +452,22 @@ impl LockAttemptError {
     }
 }
 
-/// Dependency-free jitter for `try_lock_instance`'s retry backoff - same
+/// Shared retry ceiling for both `open`'s schema-init retry and
+/// `try_lock_instance`'s claim-transaction retry — the same class of
+/// `SQLITE_BUSY`-under-real-contention race, at two different call sites.
+const MAX_BUSY_RETRY_ATTEMPTS: u32 = 100;
+
+/// Whether `error` is a genuine, retryable `SQLITE_BUSY` — shared by
+/// `LockAttemptError::is_busy` and `open`'s own schema-init retry loop,
+/// rather than duplicating this match in two places.
+fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _) if inner.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Dependency-free jitter for both busy-retry loops above - same
 /// construction as `a_journaled_float_round_trips_exactly_across_many_real_values`'s
 /// stress test below (hash fresh OS-seeded entropy plus the current time
 /// into a small range). Not cryptographically random, just enough spread
