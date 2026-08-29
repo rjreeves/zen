@@ -2016,22 +2016,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "zen"
+name = "zen-cli"
 version = "1.0.13"
 dependencies = [
  "chrono",
  "clap",
  "dirs",
  "env_logger",
- "log",
  "reedline",
- "ring",
  "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
+ "zen-lang",
+ "zen-runtime",
+]
+
+[[package]]
+name = "zen-lang"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "ring",
+ "serde_json",
  "sysinfo",
- "thiserror 1.0.69",
  "ureq",
  "zen-runtime",
  "zip",

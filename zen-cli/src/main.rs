@@ -1,10 +1,7 @@
-mod ast; // you'll add this next
 mod audit;
 mod cli;
-mod lexer;
-mod parser; // you'll add this next
-mod runtime;
-mod terminal;
+
+use zen_lang::{ast, lexer, parser, runtime, terminal};
 
 use zen_runtime::interrupt;
 use zen_runtime::permissions;

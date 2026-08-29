@@ -1,0 +1,40 @@
+[package]
+name = "zen-cli"
+version = "1.0.13"
+edition = "2021"
+description = "Zen - Windows-first scripting CLI with typed pipelines and permissions"
+license = "MIT"
+authors = ["Your Name <you@example.com>"]
+repository = "https://github.com/yourname/zen"
+build = "build.rs"
+
+[[bin]]
+name = "zen"
+path = "src/main.rs"
+
+[dependencies]
+zen-lang = { path = "../zen-lang" }
+zen-runtime = { path = "../zen-runtime" }
+
+# CLI args
+clap = { version = "4.5", features = ["derive"] }
+
+# JSON for audit logs
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Path handling & dirs
+dirs = "5.0"
+
+chrono = { version = "0.4", features = ["clock"] }
+
+# Logging (env_logger::init() in main.rs)
+env_logger = "0.11"
+
+# REPL line editing and persistent history
+reedline = "0.47"
+
+[build-dependencies]
+chrono = { version = "0.4", features = ["clock"] }

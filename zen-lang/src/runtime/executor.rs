@@ -1720,7 +1720,7 @@ impl Executor {
             .find(|doc| doc.command == command)
     }
 
-    pub(crate) fn command_permissions(&self, command: &str) -> Option<Vec<&'static str>> {
+    pub fn command_permissions(&self, command: &str) -> Option<Vec<&'static str>> {
         let permissions: Vec<_> = self
             .plugins
             .iter()
@@ -4981,7 +4981,7 @@ mod tests {
             let Value::Object(map) = file else {
                 return false;
             };
-            map.get("path").and_then(Value::as_string) == Some("src/main.rs")
+            map.get("path").and_then(Value::as_string) == Some("src/lib.rs")
                 && matches!(map.get("size"), Some(Value::Number(_)))
         }));
     }
@@ -5090,8 +5090,8 @@ mod tests {
             let Value::Object(map) = file else {
                 return false;
             };
-            map.get("path").and_then(Value::as_string) == Some("src/main.rs")
-                && map.get("name").and_then(Value::as_string) == Some("main.rs")
+            map.get("path").and_then(Value::as_string) == Some("src/lib.rs")
+                && map.get("name").and_then(Value::as_string) == Some("lib.rs")
         }));
     }
 

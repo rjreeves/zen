@@ -1,4 +1,5 @@
 use crate::ast::{CallConfig, Expr, FunctionCall};
+#[cfg(test)]
 use crate::runtime::executor::Executor;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
 use crate::runtime::plugins::secrets::write_secret;
