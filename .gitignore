@@ -12,3 +12,8 @@ obj/
 .zen/schedules.json
 .zen/events.log
 .zen/build-number
+# build.rs now lives in zen-cli/, so its build-number counter lands in
+# zen-cli/.zen/ rather than the repo root - the patterns above are
+# anchored to repo root (a mid-pattern slash in gitignore does that),
+# so also match any depth explicitly.
+**/.zen/build-number
