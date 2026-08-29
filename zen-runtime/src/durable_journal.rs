@@ -479,7 +479,7 @@ fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
 /// Every `SqliteJournal` method that talks to SQLite goes through this, not
 /// just the schema-init/lock-claim call sites that originally motivated the
 /// pattern (`open`, `try_lock_instance`) — `zen-runtime/tests/
-/// watch_resume_stress.rs` reproduces the identical raw-`SQLITE_BUSY`
+/// journal_operations_stress.rs` reproduces the identical raw-`SQLITE_BUSY`
 /// collision (`register_instance` returning `"database is locked"`) for a
 /// plain single-statement `execute`, under nothing more exotic than many
 /// real connections hammering one file concurrently — the same root cause
