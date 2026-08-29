@@ -1,4 +1,8 @@
 /target
+# Workspace member crates (zen-lang, zen-cli, ...) whose test code
+# resolves scratch dirs relative to their own crate dir (`cargo test -p`
+# sets cwd there), rather than the shared workspace-root /target.
+target/
 /target_smoke
 /dist
 bin/

@@ -7,3 +7,22 @@ license = "MIT"
 
 [dependencies]
 zen-runtime = { path = "../zen-runtime" }
+
+# JSON handling for plugin config/results
+serde_json = "1.0"
+
+# Path handling & dirs (external-plugin discovery, secret store paths, ...)
+dirs = "5.0"
+
+chrono = { version = "0.4", features = ["clock"] }
+
+# Windows process listing (process plugin)
+sysinfo = "0.30"
+
+# Hashing for Dropbox-compatible content hashes
+ring = "0.17"
+
+# HTTP client for the Dropbox plugin
+ureq = "2.9"
+
+zip = "0.6"

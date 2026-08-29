@@ -2033,6 +2033,7 @@ dependencies = [
  "sysinfo",
  "thiserror 1.0.69",
  "ureq",
+ "zen-lang",
  "zen-runtime",
  "zip",
 ]
@@ -2045,7 +2046,14 @@ version = "1.0.13"
 name = "zen-lang"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "dirs",
+ "ring",
+ "serde_json",
+ "sysinfo",
+ "ureq",
  "zen-runtime",
+ "zip",
 ]
 
 [[package]]
