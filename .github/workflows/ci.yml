@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    # zen-runtime has genuine #[cfg(windows)] behavior (cmd.exe argv/quoting -
+    # see zen-runtime/src/process.rs), and this repo describes itself as
+    # "Windows-first" - so this needs to run on the real target platform,
+    # not just any Rust host. Mirrors the sibling Flux repo's own
+    # .github/workflows/ci.yml, minus the cross-repo checkout step - zen
+    # (unlike flux-lang) has no path dependency on another repo.
+    runs-on: windows-latest
+    steps:
+      - name: Check out zen
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --workspace
