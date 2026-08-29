@@ -56,9 +56,8 @@ impl SqliteJournal {
         // it was added — `try_lock_instance`'s fix only covered the
         // lock-claim step, not this schema-init step, which turned out to
         // be racy in exactly the same way.
-        let mut attempt: u32 = 0;
-        loop {
-            match conn.execute_batch(
+        retry_on_busy(|| {
+            conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS durable_steps (
                     instance_id TEXT NOT NULL,
                     call_site TEXT NOT NULL,
@@ -81,19 +80,11 @@ impl SqliteJournal {
                     locked_at TEXT NOT NULL,
                     pid INTEGER NOT NULL
                 )",
-            ) {
-                Ok(()) => break,
-                Err(error) if is_sqlite_busy(&error) && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS => {
-                    attempt += 1;
-                    std::thread::sleep(retry_backoff(attempt));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "Failed to initialize durable_steps/durable_instances/durable_instance_locks tables: {error}"
-                    ))
-                }
-            }
-        }
+            )
+        })
+        .map_err(|error| {
+            format!("Failed to initialize durable_steps/durable_instances/durable_instance_locks tables: {error}")
+        })?;
         Ok(Self { conn, instance, cache: HashMap::new() })
     }
 
@@ -156,15 +147,17 @@ impl Journal for SqliteJournal {
 
     fn append(&mut self, id: StepId, outcome: StepOutcome) -> Result<(), String> {
         let (status, payload) = status_and_payload(&outcome);
-        self.conn
-            .execute(
+        let conn = &self.conn;
+        retry_on_busy(|| {
+            conn.execute(
                 "INSERT INTO durable_steps (instance_id, call_site, loop_key, status, result_json, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
                  ON CONFLICT (instance_id, call_site, loop_key)
                  DO UPDATE SET status = excluded.status, result_json = excluded.result_json, updated_at = excluded.updated_at",
                 params![self.instance.0, id.call_site, loop_key_to_sql(id.loop_key), status, payload],
             )
-            .map_err(|error| format!("Failed to durably append step '{}': {error}", id.call_site))?;
+        })
+        .map_err(|error| format!("Failed to durably append step '{}': {error}", id.call_site))?;
         self.cache.insert(id, StepRecord { outcome });
         Ok(())
     }
@@ -176,15 +169,17 @@ impl Journal for SqliteJournal {
         // "suspended" arm discards this payload when reconstructing an
         // in-memory `StepRecord`, since `StepOutcome::Suspended` carries no
         // data of its own.
-        self.conn
-            .execute(
+        let conn = &self.conn;
+        retry_on_busy(|| {
+            conn.execute(
                 "INSERT INTO durable_steps (instance_id, call_site, loop_key, status, result_json, updated_at)
                  VALUES (?1, ?2, ?3, 'suspended', ?4, datetime('now'))
                  ON CONFLICT (instance_id, call_site, loop_key)
                  DO UPDATE SET status = 'suspended', result_json = excluded.result_json, updated_at = excluded.updated_at",
                 params![self.instance.0, id.call_site, loop_key_to_sql(id.loop_key), wakeup.0],
             )
-            .map_err(|error| format!("Failed to durably suspend step '{}': {error}", id.call_site))?;
+        })
+        .map_err(|error| format!("Failed to durably suspend step '{}': {error}", id.call_site))?;
         self.cache.insert(id, StepRecord { outcome: StepOutcome::Suspended });
         Ok(())
     }
@@ -204,9 +199,9 @@ impl Journal for SqliteJournal {
     /// matches whichever row the `SELECT` returns first - no fan-out/
     /// multi-waiter design, a documented scope cut, not solved here.
     fn deliver(&mut self, signal: Signal, value: Value) -> Result<Option<StepId>, String> {
-        let found: Option<(String, i64)> = self
-            .conn
-            .query_row(
+        let conn = &self.conn;
+        let found: Option<(String, i64)> = retry_on_busy(|| {
+            conn.query_row(
                 "SELECT call_site, loop_key FROM durable_steps
                  WHERE instance_id = ?1 AND status = 'suspended' AND result_json = ?2
                  LIMIT 1",
@@ -214,20 +209,22 @@ impl Journal for SqliteJournal {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| format!("Failed to query for a step awaiting signal '{}': {error}", signal.0))?;
+        })
+        .map_err(|error| format!("Failed to query for a step awaiting signal '{}': {error}", signal.0))?;
 
         let Some((call_site, loop_key)) = found else {
             return Ok(None);
         };
 
         let payload = value_to_json(&value).to_string();
-        self.conn
-            .execute(
+        retry_on_busy(|| {
+            conn.execute(
                 "UPDATE durable_steps SET status = 'done', result_json = ?4, updated_at = datetime('now')
                  WHERE instance_id = ?1 AND call_site = ?2 AND loop_key = ?3",
                 params![self.instance.0, call_site, loop_key, payload],
             )
-            .map_err(|error| format!("Failed to durably deliver signal '{}': {error}", signal.0))?;
+        })
+        .map_err(|error| format!("Failed to durably deliver signal '{}': {error}", signal.0))?;
 
         let id = StepId { call_site, loop_key: loop_key_from_sql(loop_key) };
         self.cache.insert(id.clone(), StepRecord { outcome: StepOutcome::Done(value) });
@@ -235,24 +232,30 @@ impl Journal for SqliteJournal {
     }
 
     fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT call_site, loop_key, status, result_json FROM durable_steps WHERE instance_id = ?1")
-            .map_err(|error| format!("Failed to prepare resume query: {error}"))?;
-        let rows = stmt
-            .query_map(params![instance.0], |row| {
-                let call_site: String = row.get(0)?;
-                let loop_key: i64 = row.get(1)?;
-                let status: String = row.get(2)?;
-                let payload: Option<String> = row.get(3)?;
-                Ok((call_site, loop_key, status, payload))
-            })
-            .map_err(|error| format!("Failed to run resume query: {error}"))?;
+        // The whole prepare+collect round-trip is retried as one unit on a
+        // transient `SQLITE_BUSY` (same policy as every other method here) -
+        // simplest to reason about since it's a pure read with no partial
+        // effects to worry about re-running.
+        let conn = &self.conn;
+        let rows: Vec<(String, i64, String, Option<String>)> = retry_on_busy(|| {
+            let mut stmt = conn.prepare(
+                "SELECT call_site, loop_key, status, result_json FROM durable_steps WHERE instance_id = ?1",
+            )?;
+            let collected: Result<Vec<_>, _> = stmt
+                .query_map(params![instance.0], |row| {
+                    let call_site: String = row.get(0)?;
+                    let loop_key: i64 = row.get(1)?;
+                    let status: String = row.get(2)?;
+                    let payload: Option<String> = row.get(3)?;
+                    Ok((call_site, loop_key, status, payload))
+                })?
+                .collect();
+            collected
+        })
+        .map_err(|error| format!("Failed to run resume query: {error}"))?;
 
         let mut records = HashMap::new();
-        for row in rows {
-            let (call_site, loop_key, status, payload) =
-                row.map_err(|error| format!("Failed to read a durable_steps row: {error}"))?;
+        for (call_site, loop_key, status, payload) in rows {
             let id = StepId { call_site, loop_key: loop_key_from_sql(loop_key) };
             let outcome = outcome_from_row(&status, payload)?;
             records.insert(id, StepRecord { outcome });
@@ -269,13 +272,15 @@ impl Journal for SqliteJournal {
         source: String,
     ) -> Result<(), String> {
         let args_json = value_to_json(&Value::List(args)).to_string();
-        self.conn
-            .execute(
+        let conn = &self.conn;
+        retry_on_busy(|| {
+            conn.execute(
                 "INSERT OR IGNORE INTO durable_instances (instance_id, fn_name, args_json, source, created_at)
                  VALUES (?1, ?2, ?3, ?4, datetime('now'))",
                 params![instance.0, fn_name, args_json, source],
             )
-            .map_err(|error| format!("Failed to register instance '{}': {error}", instance.0))?;
+        })
+        .map_err(|error| format!("Failed to register instance '{}': {error}", instance.0))?;
         Ok(())
     }
 
@@ -287,42 +292,41 @@ impl Journal for SqliteJournal {
         // actually been re-run past that point. A registered-but-not-yet-
         // fully-resumed instance must stay discoverable even though none
         // of its steps currently read 'suspended' any more.
-        let mut stmt = self
-            .conn
-            .prepare("SELECT instance_id FROM durable_instances WHERE completed_at IS NULL")
-            .map_err(|error| format!("Failed to prepare list_incomplete_instances query: {error}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("Failed to run list_incomplete_instances query: {error}"))?;
-        let mut instances = Vec::new();
-        for row in rows {
-            instances.push(InstanceId(
-                row.map_err(|error| format!("Failed to read a durable_instances row: {error}"))?,
-            ));
-        }
-        Ok(instances)
+        //
+        // Prepare+collect retried as one unit, same as `resume` above.
+        let conn = &self.conn;
+        let rows: Vec<String> = retry_on_busy(|| {
+            let mut stmt = conn.prepare("SELECT instance_id FROM durable_instances WHERE completed_at IS NULL")?;
+            let collected: Result<Vec<_>, _> = stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+            collected
+        })
+        .map_err(|error| format!("Failed to run list_incomplete_instances query: {error}"))?;
+        Ok(rows.into_iter().map(InstanceId).collect())
     }
 
     fn mark_instance_completed(&mut self, instance: InstanceId) -> Result<(), String> {
-        self.conn
-            .execute(
+        let conn = &self.conn;
+        retry_on_busy(|| {
+            conn.execute(
                 "UPDATE durable_instances SET completed_at = datetime('now') WHERE instance_id = ?1",
                 params![instance.0],
             )
-            .map_err(|error| format!("Failed to mark instance '{}' completed: {error}", instance.0))?;
+        })
+        .map_err(|error| format!("Failed to mark instance '{}' completed: {error}", instance.0))?;
         Ok(())
     }
 
     fn lookup_instance(&self, instance: &InstanceId) -> Result<Option<RegisteredInstance>, String> {
-        let row: Option<(String, String, String)> = self
-            .conn
-            .query_row(
+        let conn = &self.conn;
+        let row: Option<(String, String, String)> = retry_on_busy(|| {
+            conn.query_row(
                 "SELECT fn_name, args_json, source FROM durable_instances WHERE instance_id = ?1",
                 params![instance.0],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
-            .map_err(|error| format!("Failed to query registered instance '{}': {error}", instance.0))?;
+        })
+        .map_err(|error| format!("Failed to query registered instance '{}': {error}", instance.0))?;
 
         let Some((fn_name, args_json, source)) = row else {
             return Ok(None);
@@ -376,12 +380,14 @@ impl Journal for SqliteJournal {
     }
 
     fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String> {
-        self.conn
-            .execute(
+        let conn = &self.conn;
+        retry_on_busy(|| {
+            conn.execute(
                 "DELETE FROM durable_instance_locks WHERE instance_id = ?1 AND pid = ?2",
                 params![instance.0, std::process::id()],
             )
-            .map_err(|error| format!("Failed to release lock for '{}': {error}", instance.0))?;
+        })
+        .map_err(|error| format!("Failed to release lock for '{}': {error}", instance.0))?;
         Ok(())
     }
 }
@@ -452,19 +458,50 @@ impl LockAttemptError {
     }
 }
 
-/// Shared retry ceiling for both `open`'s schema-init retry and
-/// `try_lock_instance`'s claim-transaction retry — the same class of
-/// `SQLITE_BUSY`-under-real-contention race, at two different call sites.
+/// Shared retry ceiling for every busy-retry site in this file — the same
+/// class of `SQLITE_BUSY`-under-real-contention race, wherever it shows up.
 const MAX_BUSY_RETRY_ATTEMPTS: u32 = 100;
 
 /// Whether `error` is a genuine, retryable `SQLITE_BUSY` — shared by
-/// `LockAttemptError::is_busy` and `open`'s own schema-init retry loop,
-/// rather than duplicating this match in two places.
+/// `LockAttemptError::is_busy` and `retry_on_busy` below, rather than
+/// duplicating this match in every call site.
 fn is_sqlite_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error,
         rusqlite::Error::SqliteFailure(inner, _) if inner.code == rusqlite::ErrorCode::DatabaseBusy
     )
+}
+
+/// Retries `f` while it fails with a transient `SQLITE_BUSY`, using the
+/// same bounded-attempts/jittered-backoff policy as `try_lock_instance`'s
+/// own claim-transaction retry (`MAX_BUSY_RETRY_ATTEMPTS` / `retry_backoff`).
+///
+/// Every `SqliteJournal` method that talks to SQLite goes through this, not
+/// just the schema-init/lock-claim call sites that originally motivated the
+/// pattern (`open`, `try_lock_instance`) — `zen-runtime/tests/
+/// watch_resume_stress.rs` reproduces the identical raw-`SQLITE_BUSY`
+/// collision (`register_instance` returning `"database is locked"`) for a
+/// plain single-statement `execute`, under nothing more exotic than many
+/// real connections hammering one file concurrently — the same root cause
+/// as `try_lock_instance_stress.rs`, just not yet caught for these simpler
+/// methods because they need much higher contention to hit the same narrow
+/// window. `open`'s connection-level `busy_timeout(5s)` alone is not
+/// sufficient here for the identical reason documented on
+/// `try_lock_instance`: it bounds how long one blocked lock acquisition
+/// retries internally, not whether a contending connection eventually wins
+/// the lock before giving up.
+fn retry_on_busy<T>(mut f: impl FnMut() -> Result<T, rusqlite::Error>) -> Result<T, rusqlite::Error> {
+    let mut attempt: u32 = 0;
+    loop {
+        match f() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_sqlite_busy(&error) && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(retry_backoff(attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Dependency-free jitter for both busy-retry loops above - same
