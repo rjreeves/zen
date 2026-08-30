@@ -3165,7 +3165,7 @@ impl ScriptRunner for Executor {
 
 impl SecretStore for Executor {
     fn read_secret(&self, name: &str) -> Result<Option<String>, String> {
-        crate::runtime::plugins::secrets::read_secret(name)
+        zen_runtime::secret_store::read_secret(name)
     }
 }
 
@@ -4059,7 +4059,7 @@ mod tests {
         crate::interrupt::clear_interrupt();
         let secret_name = format!("zen.test.canary.{}", std::process::id());
         let canary = "ZEN_CANARY_SECRET_plaintext_must_not_persist";
-        crate::runtime::plugins::secrets::write_secret(&secret_name, canary).unwrap();
+        zen_runtime::secret_store::write_secret(&secret_name, canary).unwrap();
 
         let mut executor = Executor::new_with_permissions(PermissionSet::new(&vec![
             ("proc".into(), "exec".into()),
@@ -4074,7 +4074,7 @@ mod tests {
             command, secret_name
         )));
 
-        crate::runtime::plugins::secrets::delete_secret(&secret_name).unwrap();
+        zen_runtime::secret_store::delete_secret(&secret_name).unwrap();
         result.unwrap();
 
         let Value::Object(result) = executor.ctx.vars.get("result").unwrap() else {
@@ -4148,7 +4148,7 @@ mod tests {
         crate::interrupt::clear_interrupt();
         let secret_name = format!("zen.test.persist.{}", std::process::id());
         let canary = "ZEN_CANARY_SECRET_plaintext_must_not_persist";
-        crate::runtime::plugins::secrets::write_secret(&secret_name, canary).unwrap();
+        zen_runtime::secret_store::write_secret(&secret_name, canary).unwrap();
 
         let mut executor = executor_with_state_workspace(vec![
             ("proc".into(), "exec".into()),
@@ -4169,7 +4169,7 @@ mod tests {
         let db_bytes = fs::read(&db_path).unwrap();
         let db_text = String::from_utf8_lossy(&db_bytes);
 
-        crate::runtime::plugins::secrets::delete_secret(&secret_name).unwrap();
+        zen_runtime::secret_store::delete_secret(&secret_name).unwrap();
 
         let Value::Object(result) = result.unwrap() else {
             panic!("Expected workflow result");

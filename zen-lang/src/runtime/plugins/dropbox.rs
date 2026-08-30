@@ -2,7 +2,7 @@ use crate::ast::{CallConfig, Expr, FunctionCall};
 #[cfg(test)]
 use crate::runtime::executor::Executor;
 use crate::runtime::plugin::{CommandDoc, PluginHost, PluginResult, ZenPlugin};
-use crate::runtime::plugins::secrets::write_secret;
+use zen_runtime::secret_store::write_secret;
 use crate::runtime::values::Value;
 use ring::digest::{digest, SHA256};
 use zen_runtime::values::json_to_value;
