@@ -152,6 +152,12 @@ impl Journal for WorkflowPersistence {
         Ok(None)
     }
 
+    /// Same reasoning as `deliver` immediately above - Zen never suspends,
+    /// so there's never anything to fan out to either.
+    fn deliver_all(&mut self, _signal: Signal, _value: Value) -> Result<Vec<StepId>, String> {
+        Ok(Vec::new())
+    }
+
     /// Reproduces the checkpoint/output prefetch `workflow_persistence()`
     /// has always run at connection-open time - same query, same "succeeded
     /// and checkpoint is not null" filter - just returned as a `ResumeState`
