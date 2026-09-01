@@ -80,8 +80,28 @@ pub trait Journal {
     /// (manual delivery only - no automatic dispatcher/event-bus wakeup
     /// yet; a caller re-invokes the durable fn after calling this). `None`
     /// if no suspended step matches; `Some(id)` names the step now marked
-    /// done.
+    /// done. Single-winner by design when more than one suspended step
+    /// shares the same signal string - see `deliver_all` for the fan-out
+    /// counterpart, added as a sibling rather than changing this method's
+    /// own contract (a real test, `deliver_updates_the_exact_row_not_
+    /// every_row_sharing_the_signal`, already depends on this staying
+    /// exactly a single-winner delivery).
     fn deliver(&mut self, signal: Signal, value: Value) -> Result<Option<StepId>, String>;
+    /// Deliver `value` to *every* currently-suspended step in this instance
+    /// waiting on `signal`, not just one - the fan-out counterpart to
+    /// `deliver` above (docs/DURABLE-EXECUTION.md in the Flux repo, "Known,
+    /// documented gaps" under `await`/suspension: "if two suspended steps
+    /// share the exact same signal string, `deliver` matches whichever row
+    /// its query returns first, no fan-out/multi-waiter design"). Returns
+    /// every `StepId` woken, in no particular order; an empty `Vec` if none
+    /// matched (not an error - the caller decides whether zero waiters is
+    /// itself an error, same split of responsibility `list_incomplete_
+    /// instances` already has). Two independent `await(signal)` call sites
+    /// (or two loop iterations of the same one) suspended on the exact same
+    /// signal string is the motivating case - e.g. broadcasting one event to
+    /// every waiter, rather than a first-come-first-served queue `deliver`
+    /// alone provides.
+    fn deliver_all(&mut self, signal: Signal, value: Value) -> Result<Vec<StepId>, String>;
     fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String>;
     /// Durably records which script/fn/args produced `instance`, the first
     /// time it's seen - idempotent (`INSERT OR IGNORE`: a caller

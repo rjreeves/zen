@@ -196,8 +196,9 @@ impl Journal for SqliteJournal {
     /// predicate-only `UPDATE` would silently mark *every* suspended row
     /// sharing that signal string as done in one call. If more than one
     /// suspended step happens to share the exact same signal string, this
-    /// matches whichever row the `SELECT` returns first - no fan-out/
-    /// multi-waiter design, a documented scope cut, not solved here.
+    /// matches whichever row the `SELECT` returns first - single-winner by
+    /// design, unaffected by `deliver_all` below (its fan-out sibling, not
+    /// a replacement for this method's own contract).
     fn deliver(&mut self, signal: Signal, value: Value) -> Result<Option<StepId>, String> {
         let conn = &self.conn;
         let found: Option<(String, i64)> = retry_on_busy(|| {
@@ -229,6 +230,55 @@ impl Journal for SqliteJournal {
         let id = StepId { call_site, loop_key: loop_key_from_sql(loop_key) };
         self.cache.insert(id.clone(), StepRecord { outcome: StepOutcome::Done(value) });
         Ok(Some(id))
+    }
+
+    /// `deliver`'s fan-out sibling - see the trait's own doc comment. Finds
+    /// *every* suspended row matching `signal` (no `LIMIT`, unlike
+    /// `deliver`'s single-row `SELECT`), then durably marks each one `done`
+    /// with a clone of `value` - one `UPDATE` per row, keyed by its own
+    /// exact primary key, the same "never a predicate-only bulk `UPDATE`"
+    /// discipline `deliver` already follows and for the same reason (an
+    /// `UPDATE ... WHERE status='suspended' AND result_json=?` would be
+    /// correct here too, incidentally, since fan-out actually wants every
+    /// matching row - but going row-by-row keeps this method returning the
+    /// exact set of `StepId`s it woke, which a caller needs and a bulk
+    /// `UPDATE`'s row count alone wouldn't give). Empty `Vec`, not an error,
+    /// when nothing matches - the caller decides whether that's itself
+    /// worth surfacing (see `deliver_signal_all` in the Flux repo's
+    /// `durable.rs`).
+    fn deliver_all(&mut self, signal: Signal, value: Value) -> Result<Vec<StepId>, String> {
+        let conn = &self.conn;
+        let found: Vec<(String, i64)> = retry_on_busy(|| {
+            let mut stmt = conn.prepare(
+                "SELECT call_site, loop_key FROM durable_steps
+                 WHERE instance_id = ?1 AND status = 'suspended' AND result_json = ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![self.instance.0, signal.0], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            rows
+        })
+        .map_err(|error| format!("Failed to query for steps awaiting signal '{}': {error}", signal.0))?;
+
+        let payload = value_to_json(&value).to_string();
+        let mut woken = Vec::with_capacity(found.len());
+        for (call_site, loop_key) in found {
+            retry_on_busy(|| {
+                conn.execute(
+                    "UPDATE durable_steps SET status = 'done', result_json = ?4, updated_at = datetime('now')
+                     WHERE instance_id = ?1 AND call_site = ?2 AND loop_key = ?3",
+                    params![self.instance.0, call_site, loop_key, payload],
+                )
+            })
+            .map_err(|error| {
+                format!("Failed to durably deliver signal '{}' to step '{call_site}': {error}", signal.0)
+            })?;
+
+            let id = StepId { call_site, loop_key: loop_key_from_sql(loop_key) };
+            self.cache.insert(id.clone(), StepRecord { outcome: StepOutcome::Done(value.clone()) });
+            woken.push(id);
+        }
+        Ok(woken)
     }
 
     fn resume(&mut self, instance: InstanceId) -> Result<ResumeState, String> {
@@ -740,6 +790,110 @@ mod tests {
             .filter(|id| matches!(journal.lookup(id).unwrap().outcome, StepOutcome::Done(_)))
             .count();
         assert_eq!(done_count, 1, "expected exactly one of the two suspended rows to become Done");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_all_wakes_every_suspended_row_sharing_the_signal() {
+        // deliver_all's own contrasting case to deliver's above - the exact
+        // same two-steps-one-signal setup, but proving the fan-out
+        // counterpart wakes *both*, not just one.
+        let path = temp_db_path("deliver-all-fan-out");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let id_1 = StepId { call_site: "approval#2".into(), loop_key: None };
+        let id_2 = StepId { call_site: "approval#5".into(), loop_key: None };
+
+        journal.suspend(id_1.clone(), Signal("ship-approved".into())).unwrap();
+        journal.suspend(id_2.clone(), Signal("ship-approved".into())).unwrap();
+
+        let mut woken = journal.deliver_all(Signal("ship-approved".into()), Value::Bool(true)).unwrap();
+        woken.sort_by(|a, b| a.call_site.cmp(&b.call_site));
+        assert_eq!(woken, vec![id_1.clone(), id_2.clone()]);
+
+        for id in [&id_1, &id_2] {
+            let record = journal.lookup(id).unwrap();
+            assert!(matches!(record.outcome, StepOutcome::Done(Value::Bool(true))));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_all_with_no_matching_signal_returns_an_empty_vec_not_an_error() {
+        let path = temp_db_path("deliver-all-no-match");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+
+        let woken = journal.deliver_all(Signal("nothing-waiting".into()), Value::Bool(true)).unwrap();
+        assert!(woken.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_all_does_not_wake_a_step_suspended_on_a_different_signal() {
+        let path = temp_db_path("deliver-all-different-signal");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let matching = StepId { call_site: "approval#2".into(), loop_key: None };
+        let other = StepId { call_site: "approval#5".into(), loop_key: None };
+
+        journal.suspend(matching.clone(), Signal("ship-approved".into())).unwrap();
+        journal.suspend(other.clone(), Signal("a-different-signal".into())).unwrap();
+
+        let woken = journal.deliver_all(Signal("ship-approved".into()), Value::Bool(true)).unwrap();
+        assert_eq!(woken, vec![matching]);
+        assert!(matches!(journal.lookup(&other).unwrap().outcome, StepOutcome::Suspended));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_all_is_durable_across_a_fresh_connection() {
+        // Same "drop the connection, reopen fresh" proof `deliver`'s own
+        // `deliver_then_resume_round_trips_the_delivered_value` test uses -
+        // every woken row must survive a real process restart, not just
+        // live in this connection's in-memory cache.
+        let path = temp_db_path("deliver-all-durable-across-reopen");
+        let instance = InstanceId("instance-1".into());
+        let id_1 = StepId { call_site: "approval#2".into(), loop_key: None };
+        let id_2 = StepId { call_site: "approval#5".into(), loop_key: None };
+
+        {
+            let mut journal = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+            journal.suspend(id_1.clone(), Signal("ship-approved".into())).unwrap();
+            journal.suspend(id_2.clone(), Signal("ship-approved".into())).unwrap();
+            journal.deliver_all(Signal("ship-approved".into()), Value::Number(42.0)).unwrap();
+            // journal (and its Connection) dropped here.
+        }
+
+        let mut reopened = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+        let resumed = reopened.resume(InstanceId(instance.0.clone())).unwrap();
+        for id in [&id_1, &id_2] {
+            let record = resumed.records.get(id).expect("expected the delivered row to have survived reopening");
+            assert!(matches!(record.outcome, StepOutcome::Done(Value::Number(n)) if n == 42.0));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deliver_all_only_affects_the_matching_instance() {
+        let path = temp_db_path("deliver-all-instance-isolation");
+        let id_1 = StepId { call_site: "approval#2".into(), loop_key: None };
+        let id_2 = StepId { call_site: "approval#5".into(), loop_key: None };
+
+        let mut journal_a = SqliteJournal::open(&path, InstanceId("instance-a".into())).unwrap();
+        journal_a.suspend(id_1.clone(), Signal("ship-approved".into())).unwrap();
+
+        let mut journal_b = SqliteJournal::open(&path, InstanceId("instance-b".into())).unwrap();
+        journal_b.suspend(id_2.clone(), Signal("ship-approved".into())).unwrap();
+
+        let woken = journal_a.deliver_all(Signal("ship-approved".into()), Value::Bool(true)).unwrap();
+        assert_eq!(woken, vec![id_1]);
+
+        // instance-b's own suspended row must be untouched.
+        let resumed_b = journal_b.resume(InstanceId("instance-b".into())).unwrap();
+        assert!(matches!(resumed_b.records.get(&id_2).unwrap().outcome, StepOutcome::Suspended));
 
         let _ = std::fs::remove_file(&path);
     }
