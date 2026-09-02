@@ -241,6 +241,19 @@ impl Journal for WorkflowPersistence {
     fn unlock_instance(&mut self, _instance: &InstanceId) -> Result<(), String> {
         Ok(())
     }
+
+    /// Zen has no `rollback {}` concept through this trait (its own
+    /// separate `workflow.rs` `retry`/`rollback` handling doesn't go
+    /// through `Journal` at all), so there's nothing to durably mark.
+    fn mark_rollback_fired(&mut self, _id: StepId) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Same reasoning as `mark_rollback_fired` immediately above - always
+    /// `false`, never blocks Zen's own separate mechanism.
+    fn rollback_already_fired(&self, _id: &StepId) -> bool {
+        false
+    }
 }
 
 /// Runs `workflow.run` workflows against a `WorkflowHost` instead of the
