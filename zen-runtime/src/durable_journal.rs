@@ -13,7 +13,7 @@
 //! before returning, so a caller that actually relies on the trait's
 //! contract (as Flux's durable functions do) gets what it asked for.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -24,6 +24,13 @@ pub struct SqliteJournal {
     conn: Connection,
     instance: InstanceId,
     cache: HashMap<StepId, StepRecord>,
+    /// Every `StepId` whose `rollback {}` action is durably known to have
+    /// already fired for this instance — crash-durable rollback's own
+    /// idempotency set (see `Journal::rollback_already_fired`'s doc
+    /// comment), prefetched by `resume` and updated by
+    /// `mark_rollback_fired`, mirroring `cache`'s own "resume once, read
+    /// in-memory after" shape.
+    fired_rollbacks: HashSet<StepId>,
 }
 
 impl SqliteJournal {
@@ -79,13 +86,28 @@ impl SqliteJournal {
                     instance_id TEXT PRIMARY KEY,
                     locked_at TEXT NOT NULL,
                     pid INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS durable_rollbacks_fired (
+                    instance_id TEXT NOT NULL,
+                    call_site TEXT NOT NULL,
+                    loop_key INTEGER NOT NULL,
+                    fired_at TEXT NOT NULL,
+                    PRIMARY KEY (instance_id, call_site, loop_key)
                 )",
             )
         })
         .map_err(|error| {
-            format!("Failed to initialize durable_steps/durable_instances/durable_instance_locks tables: {error}")
+            format!(
+                "Failed to initialize durable_steps/durable_instances/durable_instance_locks/\
+                 durable_rollbacks_fired tables: {error}"
+            )
         })?;
-        Ok(Self { conn, instance, cache: HashMap::new() })
+        Ok(Self {
+            conn,
+            instance,
+            cache: HashMap::new(),
+            fired_rollbacks: HashSet::new(),
+        })
     }
 
     /// Opens a journal for dispatcher use - `register_instance`/
@@ -311,6 +333,29 @@ impl Journal for SqliteJournal {
             records.insert(id, StepRecord { outcome });
         }
         self.cache = records.clone();
+
+        // Crash-durable rollback's own idempotency set (see
+        // `mark_rollback_fired`/`rollback_already_fired`) — prefetched
+        // alongside `cache` above, same "resume once, read in-memory after"
+        // shape, one extra query against the sibling table.
+        let fired_rows: Vec<(String, i64)> = retry_on_busy(|| {
+            let mut stmt = conn.prepare(
+                "SELECT call_site, loop_key FROM durable_rollbacks_fired WHERE instance_id = ?1",
+            )?;
+            let collected: Result<Vec<_>, _> = stmt
+                .query_map(params![instance.0], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect();
+            collected
+        })
+        .map_err(|error| format!("Failed to run resume query for fired rollbacks: {error}"))?;
+        self.fired_rollbacks = fired_rows
+            .into_iter()
+            .map(|(call_site, loop_key)| StepId {
+                call_site,
+                loop_key: loop_key_from_sql(loop_key),
+            })
+            .collect();
+
         Ok(ResumeState { records })
     }
 
@@ -439,6 +484,30 @@ impl Journal for SqliteJournal {
         })
         .map_err(|error| format!("Failed to release lock for '{}': {error}", instance.0))?;
         Ok(())
+    }
+
+    /// `INSERT OR IGNORE`, matching `register_instance`'s own idempotent
+    /// pattern - calling this twice for the same `id` (e.g. a caller that
+    /// doesn't itself track whether it already marked something fired) is
+    /// not an error, just a no-op the second time.
+    fn mark_rollback_fired(&mut self, id: StepId) -> Result<(), String> {
+        let conn = &self.conn;
+        retry_on_busy(|| {
+            conn.execute(
+                "INSERT OR IGNORE INTO durable_rollbacks_fired (instance_id, call_site, loop_key, fired_at)
+                 VALUES (?1, ?2, ?3, datetime('now'))",
+                params![self.instance.0, id.call_site, loop_key_to_sql(id.loop_key)],
+            )
+        })
+        .map_err(|error| {
+            format!("Failed to durably mark rollback fired for step '{}': {error}", id.call_site)
+        })?;
+        self.fired_rollbacks.insert(id);
+        Ok(())
+    }
+
+    fn rollback_already_fired(&self, id: &StepId) -> bool {
+        self.fired_rollbacks.contains(id)
     }
 }
 
@@ -894,6 +963,76 @@ mod tests {
         // instance-b's own suspended row must be untouched.
         let resumed_b = journal_b.resume(InstanceId("instance-b".into())).unwrap();
         assert!(matches!(resumed_b.records.get(&id_2).unwrap().outcome, StepOutcome::Suspended));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rollback_already_fired_is_false_until_mark_rollback_fired_is_called() {
+        let path = temp_db_path("rollback-fired-basic");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let id = StepId { call_site: "release#0".into(), loop_key: None };
+
+        assert!(!journal.rollback_already_fired(&id));
+        journal.mark_rollback_fired(id.clone()).unwrap();
+        assert!(journal.rollback_already_fired(&id));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mark_rollback_fired_twice_for_the_same_step_is_not_an_error() {
+        let path = temp_db_path("rollback-fired-idempotent");
+        let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
+        let id = StepId { call_site: "release#0".into(), loop_key: None };
+
+        journal.mark_rollback_fired(id.clone()).unwrap();
+        journal.mark_rollback_fired(id.clone()).unwrap();
+        assert!(journal.rollback_already_fired(&id));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rollback_fired_marker_is_durable_across_a_fresh_connection() {
+        // Same "drop the connection, reopen fresh" proof `deliver`'s own
+        // durability test uses - `mark_rollback_fired` must survive a real
+        // process restart, not just live in this connection's in-memory
+        // `fired_rollbacks` set.
+        let path = temp_db_path("rollback-fired-durable-across-reopen");
+        let instance = InstanceId("instance-1".into());
+        let id = StepId { call_site: "release#0".into(), loop_key: None };
+
+        {
+            let mut journal = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+            journal.mark_rollback_fired(id.clone()).unwrap();
+            // journal (and its Connection) dropped here.
+        }
+
+        let mut reopened = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+        // A fresh handle's in-memory set starts empty - only `resume` (or a
+        // write) populates it, same as `cache`.
+        assert!(!reopened.rollback_already_fired(&id));
+        reopened.resume(InstanceId(instance.0.clone())).unwrap();
+        assert!(reopened.rollback_already_fired(&id));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rollback_fired_marker_only_affects_the_matching_instance() {
+        let path = temp_db_path("rollback-fired-instance-isolation");
+        let id = StepId { call_site: "release#0".into(), loop_key: None };
+
+        let mut journal_a = SqliteJournal::open(&path, InstanceId("instance-a".into())).unwrap();
+        journal_a.mark_rollback_fired(id.clone()).unwrap();
+
+        let mut journal_b = SqliteJournal::open(&path, InstanceId("instance-b".into())).unwrap();
+        journal_b.resume(InstanceId("instance-b".into())).unwrap();
+        assert!(
+            !journal_b.rollback_already_fired(&id),
+            "instance-b shares the same call_site/loop_key but must not see instance-a's marker"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

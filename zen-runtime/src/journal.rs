@@ -166,4 +166,20 @@ pub trait Journal {
     /// `&mut dyn Journal` would conflict with the rest of the function also
     /// needing it mutably.
     fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String>;
+    /// Durably marks that `id`'s own `rollback {}` action has actually run
+    /// to completion for this instance - the idempotency marker
+    /// crash-durable rollback unwinding needs (docs/DURABLE-EXECUTION.md
+    /// in the Flux repo, "Crash-durable retry/rollback" §2) to avoid
+    /// re-firing an already-completed rollback action if a later replay
+    /// re-triggers the same unwind (e.g. after a crash landed mid-unwind,
+    /// after some but not all queued rollback actions had already run).
+    /// Carries no payload, unlike `append` - a rollback action's own return
+    /// value is never replayed or read back, only whether it ran at all.
+    /// Idempotent: calling it twice for the same `id` is not an error.
+    fn mark_rollback_fired(&mut self, id: StepId) -> Result<(), String>;
+    /// Whether `mark_rollback_fired` has already been called for `id` in
+    /// this instance. Zen has no rollback concept of its own through this
+    /// trait (its own separate `workflow.rs` mechanism handles that) and
+    /// stubs this to always `false`.
+    fn rollback_already_fired(&self, id: &StepId) -> bool;
 }
