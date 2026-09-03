@@ -744,7 +744,19 @@ impl LockAttemptError {
 
 /// Shared retry ceiling for every busy-retry site in this file — the same
 /// class of `SQLITE_BUSY`-under-real-contention race, wherever it shows up.
-const MAX_BUSY_RETRY_ATTEMPTS: u32 = 100;
+/// Raised from 100 (a ~4.4s worst-case wait, per `retry_backoff`'s own math)
+/// after a real CI failure: `journal_operations_stress.rs`'s 24-thread test
+/// exceeded the old budget on a GitHub Actions Windows runner under load —
+/// itself a pre-existing, occasionally-flaky scenario on that same test
+/// even before the cross-host lease/heartbeat redesign (confirmed against
+/// this repo's own CI history, two earlier unrelated failures predating
+/// that work entirely), which adds genuinely more background write
+/// activity and so makes the same narrow window more likely to be hit, not
+/// a new failure mode. 300 attempts, paired with `retry_backoff`'s raised
+/// cap below, gives roughly 27s of worst-case headroom instead of ~4.4s —
+/// still a bounded ceiling, not unlimited retry, but real margin for a
+/// slow or noisy runner under heavy real contention.
+const MAX_BUSY_RETRY_ATTEMPTS: u32 = 300;
 
 /// Whether `error` is a genuine, retryable `SQLITE_BUSY` — shared by
 /// `LockAttemptError::is_busy` and `retry_on_busy` below, rather than
@@ -803,8 +815,8 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u32(attempt);
     hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let jitter_ms = hasher.finish() % 8; // 0..=7ms of jitter
-    let base_ms = u64::from(attempt).saturating_mul(2).min(50); // linear ramp, capped at 50ms
+    let jitter_ms = hasher.finish() % 15; // 0..=14ms of jitter - widened alongside the raised cap below
+    let base_ms = u64::from(attempt).saturating_mul(2).min(100); // linear ramp, capped at 100ms (was 50ms - see MAX_BUSY_RETRY_ATTEMPTS's own doc comment)
     std::time::Duration::from_millis(base_ms + jitter_ms)
 }
 
