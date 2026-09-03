@@ -14,6 +14,8 @@
 //! contract (as Flux's durable functions do) gets what it asked for.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -31,6 +33,41 @@ pub struct SqliteJournal {
     /// `mark_rollback_fired`, mirroring `cache`'s own "resume once, read
     /// in-memory after" shape.
     fired_rollbacks: HashSet<StepId>,
+    /// The file this journal was opened against — kept so `try_lock_instance`
+    /// can spawn a lease-renewal heartbeat thread with its *own* independent
+    /// `Connection` to the same file (see `LockHeartbeat`'s own doc comment;
+    /// `self.conn` can't be shared across threads without real contention
+    /// with this connection's own ordinary use).
+    db_path: String,
+    /// The active lease-renewal heartbeat for whichever instance lock this
+    /// journal currently holds (`try_lock_instance`'s own doc comment,
+    /// "Cross-host distributed replay locking" in the Flux repo's
+    /// `docs/DURABLE-EXECUTION.md`) — `None` when no lock is held. Set by
+    /// `try_lock_instance` on success, cleared (signaling the thread to
+    /// stop) by `unlock_instance`.
+    heartbeat: Option<LockHeartbeat>,
+}
+
+/// A background thread that periodically re-touches `durable_instance_
+/// locks.locked_at` for the instance this journal currently holds the lock
+/// for, so the lease doesn't go stale (and get reclaimed by another host)
+/// while this process is still genuinely, actively working — a durable fn
+/// call can legitimately run far longer than any single lease TTL (a real
+/// `exec()`/`fetch()` step can take minutes), and nothing else in the
+/// existing write path (`append`/`suspend`/etc.) fires reliably often
+/// enough on its own to serve as an implicit heartbeat — a single
+/// long-running step produces no journal writes at all for its own
+/// duration. See `docs/DURABLE-EXECUTION.md`'s "Cross-host distributed
+/// replay locking" section for the full design and its honest limits.
+///
+/// Deliberately holds no `JoinHandle` — `unlock_instance` signals `stop`
+/// and returns immediately rather than blocking on the thread's actual
+/// exit (up to one `HEARTBEAT_INTERVAL` later); dropping a `JoinHandle`
+/// without joining it does not stop the thread it names, so there is
+/// nothing to gain by storing one here just to let it fall out of scope
+/// unused.
+struct LockHeartbeat {
+    stop: Arc<AtomicBool>,
 }
 
 impl SqliteJournal {
@@ -107,6 +144,8 @@ impl SqliteJournal {
             instance,
             cache: HashMap::new(),
             fired_rollbacks: HashSet::new(),
+            db_path: db_path.to_string(),
+            heartbeat: None,
         })
     }
 
@@ -459,12 +498,23 @@ impl Journal for SqliteJournal {
     /// closes that gap - this is this codebase's real, previously flaky
     /// two-watcher-on-one-journal regression (`flux-cli/tests/run.rs`'s
     /// `two_watchers_on_the_same_journal_file_both_still_resume_correctly`).
+    ///
+    /// On success, starts this lock's lease-renewal heartbeat (see
+    /// `LockHeartbeat`'s own doc comment and "Cross-host distributed replay
+    /// locking" in the Flux repo's `docs/DURABLE-EXECUTION.md`) - a caller
+    /// that later re-locks the same journal (e.g. a second `run_durable`
+    /// call reusing one `SqliteJournal` value) gets a fresh heartbeat each
+    /// time, `unlock_instance` having stopped the previous one.
     fn try_lock_instance(&mut self, instance: &InstanceId) -> Result<bool, String> {
         let pid = std::process::id();
         let mut attempt: u32 = 0;
         loop {
             match self.try_lock_instance_once(instance, pid) {
-                Ok(acquired) => return Ok(acquired),
+                Ok(true) => {
+                    self.start_heartbeat(instance);
+                    return Ok(true);
+                }
+                Ok(false) => return Ok(false),
                 Err(error) if error.is_busy() && attempt + 1 < MAX_BUSY_RETRY_ATTEMPTS => {
                     attempt += 1;
                     std::thread::sleep(retry_backoff(attempt));
@@ -475,6 +525,15 @@ impl Journal for SqliteJournal {
     }
 
     fn unlock_instance(&mut self, instance: &InstanceId) -> Result<(), String> {
+        // Signal-and-detach, not join: the thread notices within one
+        // `HEARTBEAT_INTERVAL` and exits on its own. Blocking here would add
+        // up to that same latency to every single durable-fn completion, for
+        // no correctness benefit - a stray renewal firing after the DELETE
+        // below just affects zero rows (see `start_heartbeat`'s own doc
+        // comment).
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.stop.store(true, Ordering::Relaxed);
+        }
         let conn = &self.conn;
         retry_on_busy(|| {
             conn.execute(
@@ -519,18 +578,38 @@ impl SqliteJournal {
     /// `rusqlite::Error`) instead of an already-formatted `String`, so the
     /// caller can distinguish a retryable `SQLITE_BUSY` from everything
     /// else before deciding whether to give up.
+    ///
+    /// Reclaim is decided by **lease staleness** (`locked_at` older than
+    /// `LEASE_TTL`), not PID liveness — see "Cross-host distributed replay
+    /// locking" in the Flux repo's `docs/DURABLE-EXECUTION.md` for why the
+    /// PID check this replaced was actively unsafe across hosts sharing a
+    /// journal file over a network filesystem (a PID recorded by one host
+    /// is meaningless when checked against a *different* host's own process
+    /// table — not merely untested, but wrong in both directions). `pid` is
+    /// still recorded on the row (useful for diagnostics — "which process
+    /// most recently held this"), just no longer consulted for the reclaim
+    /// decision itself. The tradeoff, stated plainly: a same-host crash's
+    /// lock is no longer reclaimed instantly (as PID-liveness allowed) —
+    /// now it waits out `LEASE_TTL` like every other case, cross-host or
+    /// not, since there is no way to reliably tell, from inside this
+    /// function, which case applies.
     fn try_lock_instance_once(&mut self, instance: &InstanceId, pid: u32) -> Result<bool, LockAttemptError> {
         let tx = self.conn.transaction().map_err(LockAttemptError::Transaction)?;
-        let existing: Option<i64> = tx
+        // `strftime('%s', ...)` parses SQLite's own `datetime('now')` output
+        // format back into Unix epoch seconds — plain integer subtraction,
+        // no timezone ambiguity (both sides are UTC, SQLite's default), no
+        // change needed to how `locked_at` is stored elsewhere.
+        let age_seconds: Option<i64> = tx
             .query_row(
-                "SELECT pid FROM durable_instance_locks WHERE instance_id = ?1",
+                "SELECT strftime('%s','now') - strftime('%s', locked_at) FROM durable_instance_locks \
+                 WHERE instance_id = ?1",
                 params![instance.0],
                 |row| row.get(0),
             )
             .optional()
             .map_err(LockAttemptError::ReadLockRow)?;
-        if let Some(holder_pid) = existing {
-            if pid_is_alive(holder_pid as u32) {
+        if let Some(age) = age_seconds {
+            if age < LEASE_TTL_SECONDS {
                 return Ok(false);
             }
             tx.execute(
@@ -547,7 +626,93 @@ impl SqliteJournal {
         tx.commit().map_err(LockAttemptError::Commit)?;
         Ok(true)
     }
+
+    /// Spawns `LockHeartbeat`'s background thread for the lock this journal
+    /// just acquired on `instance` - periodically re-touches `locked_at` so
+    /// the lease doesn't go stale while this process is still genuinely
+    /// working (see `LockHeartbeat`'s own doc comment for why nothing in the
+    /// existing write path can serve as an implicit heartbeat instead). Uses
+    /// its own independent `Connection` to `self.db_path`, not `self.conn` -
+    /// `rusqlite::Connection` is `Send` but not `Sync`, and this journal's
+    /// own connection is actively used by the calling thread throughout the
+    /// held call, so sharing it would mean real, avoidable synchronization
+    /// (a `Mutex`) for what's otherwise a single unconditional `UPDATE` every
+    /// few seconds - a second, independent connection to the same file is
+    /// simpler and exactly what SQLite's own file-level locking is for.
+    /// Failures (a closed file, a transient busy error) are swallowed, not
+    /// propagated - a missed heartbeat is not fatal on its own (`LEASE_TTL`
+    /// is a `HEARTBEAT_INTERVAL_SECONDS` multiple, giving real margin for a
+    /// handful of missed renewals), and this thread has no `Result`-
+    /// returning caller to report to regardless.
+    fn start_heartbeat(&mut self, instance: &InstanceId) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let db_path = self.db_path.clone();
+        let instance_id = instance.0.clone();
+        let pid = std::process::id();
+        std::thread::spawn(move || {
+            let Ok(conn) = Connection::open(&db_path) else {
+                return;
+            };
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
+            let heartbeat_interval = std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS);
+            let poll_interval = std::time::Duration::from_millis(100);
+            let mut since_last_renewal = std::time::Duration::ZERO;
+            // Sleeps in small steps and checks `stop` between each one,
+            // rather than one `UPDATE` then a single long sleep - two real
+            // reasons, not just tidiness. First, `unlock_instance` signals
+            // `stop` and returns without joining (see its own doc comment),
+            // so responsiveness here is the only thing bounding how long a
+            // stray renewal could still fire after the lock's own row is
+            // long gone (harmless, per `start_heartbeat`'s own doc comment,
+            // but not worth dragging out). Second, and the reason this loop
+            // was reshaped at all: a lock held for well under one interval —
+            // the overwhelmingly common case, most durable-fn calls finish
+            // in milliseconds — must fire *zero* renewal writes, not one
+            // immediately on acquisition. A freshly-claimed lease is already
+            // fresh; an immediate write adds nothing but contention, and a
+            // real stress test caught exactly that regression:
+            // `many_threads_hammering_ordinary_journal_methods_never_
+            // surfaces_a_raw_busy_error` (zen-runtime/tests/
+            // journal_operations_stress.rs) started intermittently
+            // exceeding its busy-retry budget once every lock acquisition
+            // also fired an immediate extra write into an already
+            // heavily-contended file.
+            while !stop_for_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(poll_interval);
+                if stop_for_thread.load(Ordering::Relaxed) {
+                    break;
+                }
+                since_last_renewal += poll_interval;
+                if since_last_renewal >= heartbeat_interval {
+                    let _ = conn.execute(
+                        "UPDATE durable_instance_locks SET locked_at = datetime('now') \
+                         WHERE instance_id = ?1 AND pid = ?2",
+                        params![instance_id, pid],
+                    );
+                    since_last_renewal = std::time::Duration::ZERO;
+                }
+            }
+        });
+        self.heartbeat = Some(LockHeartbeat { stop });
+    }
 }
+
+/// How long a lock may go unrenewed before another host (or the same host)
+/// may reclaim it — see `try_lock_instance_once`'s own doc comment. Five
+/// times `HEARTBEAT_INTERVAL_SECONDS`, the same safety-margin convention
+/// this file already applies elsewhere (`SqliteJournal::open`'s comment on
+/// `busy_timeout` vs. real contention): a handful of missed renewals under
+/// transient contention or network-filesystem latency should not cause a
+/// false reclaim from a still-live holder.
+const LEASE_TTL_SECONDS: i64 = 10;
+/// How often a held lock's heartbeat thread re-touches `locked_at`. Chosen
+/// so a genuinely dead holder's lock becomes reclaimable within roughly
+/// `LEASE_TTL_SECONDS` of it actually dying — not tied to any other
+/// interval in this codebase (e.g. `--watch`'s own default poll interval)
+/// on purpose, since this lease has nothing to do with polling for a
+/// delivered signal.
+const HEARTBEAT_INTERVAL_SECONDS: u64 = 2;
 
 /// Which step of the lock-claim transaction failed, carrying the
 /// underlying `rusqlite::Error` so `try_lock_instance` can both (a) check
@@ -579,7 +744,19 @@ impl LockAttemptError {
 
 /// Shared retry ceiling for every busy-retry site in this file — the same
 /// class of `SQLITE_BUSY`-under-real-contention race, wherever it shows up.
-const MAX_BUSY_RETRY_ATTEMPTS: u32 = 100;
+/// Raised from 100 (a ~4.4s worst-case wait, per `retry_backoff`'s own math)
+/// after a real CI failure: `journal_operations_stress.rs`'s 24-thread test
+/// exceeded the old budget on a GitHub Actions Windows runner under load —
+/// itself a pre-existing, occasionally-flaky scenario on that same test
+/// even before the cross-host lease/heartbeat redesign (confirmed against
+/// this repo's own CI history, two earlier unrelated failures predating
+/// that work entirely), which adds genuinely more background write
+/// activity and so makes the same narrow window more likely to be hit, not
+/// a new failure mode. 300 attempts, paired with `retry_backoff`'s raised
+/// cap below, gives roughly 27s of worst-case headroom instead of ~4.4s —
+/// still a bounded ceiling, not unlimited retry, but real margin for a
+/// slow or noisy runner under heavy real contention.
+const MAX_BUSY_RETRY_ATTEMPTS: u32 = 300;
 
 /// Whether `error` is a genuine, retryable `SQLITE_BUSY` — shared by
 /// `LockAttemptError::is_busy` and `retry_on_busy` below, rather than
@@ -638,27 +815,11 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
     let mut hasher = RandomState::new().build_hasher();
     hasher.write_u32(attempt);
     hasher.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let jitter_ms = hasher.finish() % 8; // 0..=7ms of jitter
-    let base_ms = u64::from(attempt).saturating_mul(2).min(50); // linear ramp, capped at 50ms
+    let jitter_ms = hasher.finish() % 15; // 0..=14ms of jitter - widened alongside the raised cap below
+    let base_ms = u64::from(attempt).saturating_mul(2).min(100); // linear ramp, capped at 100ms (was 50ms - see MAX_BUSY_RETRY_ATTEMPTS's own doc comment)
     std::time::Duration::from_millis(base_ms + jitter_ms)
 }
 
-/// Whether `pid` currently identifies a running OS process — used by
-/// `try_lock_instance` to decide whether an existing lock row was
-/// abandoned by a crashed holder (safe to reclaim) or still belongs to a
-/// live one (must not steal it). A known, accepted, industry-standard
-/// limitation: PID reuse could in rare cases make a dead-then-recycled PID
-/// look alive again, or (far more narrowly) a lock check could race a
-/// brand-new process being assigned the exact PID just freed by the real
-/// holder's exit — single-machine only, no cross-host story.
-fn pid_is_alive(pid: u32) -> bool {
-    let mut system = sysinfo::System::new_all();
-    system.refresh_all();
-    system
-        .processes()
-        .keys()
-        .any(|candidate| candidate.as_u32() == pid)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1289,13 +1450,18 @@ mod tests {
     }
 
     #[test]
-    fn try_lock_instance_fails_when_already_locked_by_a_live_process() {
+    fn try_lock_instance_fails_while_a_fresh_lease_is_held() {
         let path = temp_db_path("lock-contended");
         let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
         let instance = InstanceId("instance-1".into());
 
-        // Lock the row directly with this *test process's own* pid - it's
-        // definitely alive, standing in for a genuinely concurrent holder.
+        // Lock the row directly, `locked_at = now()` - fresh, standing in
+        // for a genuinely concurrent holder's own just-acquired lease. `pid`
+        // is irrelevant to the reclaim decision now (see `try_lock_instance_
+        // once`'s own doc comment) - this test's own pid is used only
+        // because a real caller always would too, not because it matters
+        // here; `try_lock_instance_reclaims_a_stale_lease_regardless_of_pid`
+        // below proves that directly.
         journal
             .conn
             .execute(
@@ -1305,37 +1471,36 @@ mod tests {
             .unwrap();
 
         let acquired = journal.try_lock_instance(&instance).unwrap();
-        assert!(!acquired, "expected the lock to be refused while a live process holds it");
+        assert!(!acquired, "expected the lock to be refused while a fresh lease is held");
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn try_lock_instance_reclaims_a_lock_held_by_a_dead_pid() {
+    fn try_lock_instance_reclaims_a_stale_lease_regardless_of_pid() {
+        // Cross-host distributed replay locking: reclaim is decided purely
+        // by lease staleness now, not PID liveness (see `try_lock_instance_
+        // once`'s own doc comment for why a PID check is actively unsafe
+        // once a journal file might be shared across hosts). Uses this
+        // test's *own*, definitely-live pid as the recorded holder -
+        // proving directly that a stale lease is reclaimed even when the
+        // recorded pid would pass a liveness check, not merely when it
+        // happens to fail one.
         let path = temp_db_path("lock-stale");
         let mut journal = SqliteJournal::open(&path, InstanceId("instance-1".into())).unwrap();
         let instance = InstanceId("instance-1".into());
 
-        // A trivial, fast-exiting child process - waited on, so its pid is
-        // genuinely dead by the time we use it, not just an assumed-unused
-        // number that happens not to be running right now.
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "exit", "0"])
-            .spawn()
-            .expect("failed to spawn a throwaway child process");
-        let dead_pid = child.id();
-        child.wait().expect("failed to wait for the throwaway child process");
-
         journal
             .conn
             .execute(
-                "INSERT INTO durable_instance_locks (instance_id, locked_at, pid) VALUES (?1, datetime('now'), ?2)",
-                params![instance.0, dead_pid],
+                "INSERT INTO durable_instance_locks (instance_id, locked_at, pid) \
+                 VALUES (?1, datetime('now', '-1 hour'), ?2)",
+                params![instance.0, std::process::id()],
             )
             .unwrap();
 
         let acquired = journal.try_lock_instance(&instance).unwrap();
-        assert!(acquired, "expected a lock held by a dead pid to be reclaimed");
+        assert!(acquired, "expected a stale lease to be reclaimed regardless of the recorded pid");
 
         let holder_pid: i64 = journal
             .conn
@@ -1370,6 +1535,40 @@ mod tests {
         assert!(
             journal.try_lock_instance(&instance).unwrap(),
             "expected a second lock attempt to succeed once the first was released"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_held_lock_survives_past_the_lease_ttl_via_its_own_heartbeat() {
+        // The actual point of this whole design: a lock held for longer
+        // than LEASE_TTL_SECONDS must NOT become reclaimable while its
+        // owning process is still genuinely, actively working - that's
+        // exactly what the heartbeat thread exists to prevent. Real time,
+        // not simulated - genuinely sleeps past what the lease would need
+        // to go stale without renewal.
+        let path = temp_db_path("lock-heartbeat-survives");
+        let instance = InstanceId("instance-1".into());
+
+        let mut holder = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+        assert!(holder.try_lock_instance(&instance).unwrap());
+
+        std::thread::sleep(std::time::Duration::from_secs(LEASE_TTL_SECONDS as u64 + 2));
+
+        // A separate handle, standing in for another process/host racing to
+        // resume the same instance - must still be refused.
+        let mut contender = SqliteJournal::open(&path, InstanceId(instance.0.clone())).unwrap();
+        assert!(
+            !contender.try_lock_instance(&instance).unwrap(),
+            "expected the lock to still be held - its heartbeat should have kept the lease fresh \
+             well past LEASE_TTL_SECONDS"
+        );
+
+        holder.unlock_instance(&instance).unwrap();
+        assert!(
+            contender.try_lock_instance(&instance).unwrap(),
+            "expected the lock to be immediately acquirable once genuinely released"
         );
 
         let _ = std::fs::remove_file(&path);
