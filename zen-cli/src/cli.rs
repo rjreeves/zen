@@ -1684,6 +1684,7 @@ fn format_repl_value(value: &Value) -> String {
         Value::String(value) => format!("{:?}", value),
         Value::Secret(_) => value.redacted().into(),
         Value::Encrypted(_) => "[encrypted]".into(),
+        Value::Bytes(bytes) => format!("[{} bytes]", bytes.len()),
         Value::Object(_) | Value::List(_) => {
             serde_json::to_string(&value_to_json(value)).unwrap_or_else(|_| format!("{:?}", value))
         }
@@ -1700,6 +1701,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
         Value::String(value) => serde_json::Value::String(value.clone()),
         Value::Secret(_) => serde_json::Value::String(value.redacted().into()),
         Value::Encrypted(_) => serde_json::Value::String("[encrypted]".into()),
+        Value::Bytes(bytes) => serde_json::Value::String(format!("[{} bytes]", bytes.len())),
         Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
         Value::Object(fields) => {
             let mut object = serde_json::Map::new();
