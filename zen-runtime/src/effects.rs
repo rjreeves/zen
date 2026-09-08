@@ -40,10 +40,20 @@ pub enum Effect {
 /// `fs_copy`/`workspace.*`: this effect is the narrow "read one file" /
 /// "write one file" / "list one directory" primitive, not a port of Zen's
 /// richer, workspace-confined surface).
+///
+/// `ReadBytes`/`WriteBytes` are additive too, for Flux's `read_bytes`/
+/// `write_bytes` - `Read`/`Write` go through `fs::read_to_string`/a
+/// `String` `contents` field, so a non-UTF-8 file (an image, an archive,
+/// any real binary format) always fails `Read` with a UTF-8 decode error,
+/// and `Write` can never produce one at all. These two use `fs::read`/
+/// `fs::write::<[u8]>` directly instead, carrying `Value::Bytes` on the
+/// success side.
 pub enum FsRequest {
     Read { path: PathBuf },
     Write { path: PathBuf, contents: String },
     List { path: PathBuf },
+    ReadBytes { path: PathBuf },
+    WriteBytes { path: PathBuf, contents: Vec<u8> },
 }
 
 /// The outcome of performing an effect: a value, never a panic across the
@@ -90,6 +100,13 @@ impl Effects for FsEffects {
                 Ok(Value::Bool(true))
             }
             Effect::Fs(FsRequest::List { path }) => list_directory(&path).map_err(|error| error.to_string()),
+            Effect::Fs(FsRequest::ReadBytes { path }) => fs::read(&path)
+                .map(Value::Bytes)
+                .map_err(|error| error.to_string()),
+            Effect::Fs(FsRequest::WriteBytes { path, contents }) => {
+                fs::write(&path, &contents).map_err(|error| error.to_string())?;
+                Ok(Value::Bool(true))
+            }
             Effect::Process(_) => Err("FsEffects does not handle process effects".into()),
             Effect::Net(_) => Err("FsEffects does not handle network effects".into()),
         }
@@ -208,6 +225,47 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_effects_writes_then_reads_real_non_utf8_bytes() {
+        // The exact real bug ReadBytes/WriteBytes fix: 0xFF/0xFE is not
+        // valid UTF-8 (confirmed directly - str::from_utf8 on this exact
+        // byte sequence errors), so `Read`/`Write`'s own
+        // fs::read_to_string/String-typed `contents` could never round-trip
+        // this at all.
+        let raw: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x02, b'h', b'i'];
+        assert!(std::str::from_utf8(&raw).is_err(), "test fixture must be genuinely non-UTF-8");
+
+        let dir = std::env::temp_dir().join(format!("zen-runtime-fs-bytes-effect-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("effect.bin");
+
+        let write_outcome = FsEffects.perform(
+            Effect::Fs(FsRequest::WriteBytes { path: path.clone(), contents: raw.clone() }),
+            &CapabilityGrant::new("fs.write"),
+        );
+        assert!(matches!(write_outcome, Ok(Value::Bool(true))));
+
+        let read_outcome = FsEffects.perform(
+            Effect::Fs(FsRequest::ReadBytes { path: path.clone() }),
+            &CapabilityGrant::new("fs.read"),
+        );
+        match read_outcome {
+            Ok(Value::Bytes(contents)) => assert_eq!(contents, raw),
+            other => panic!("Expected read-back bytes, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fs_effects_read_bytes_reports_missing_file() {
+        let outcome = FsEffects.perform(
+            Effect::Fs(FsRequest::ReadBytes { path: PathBuf::from("this-path-should-not-exist-anywhere") }),
+            &CapabilityGrant::new("fs.read"),
+        );
+        assert!(outcome.is_err());
     }
 
     #[test]
